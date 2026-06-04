@@ -1,0 +1,11 @@
+case,time
+2DBox_CXR_demo.npz,1.6401071548461914
+2DBox_Dermoscopy_demo.npz,3.0999627113342285
+2DBox_Endoscopy_demo.npz,2.7011821269989014
+2DBox_Fundus_demo.npz,4.459224700927734
+2DBox_Mammography_demo.npz,7.83874773979187
+2DBox_Microscope_demo.npz,10.50558853149414
+2DBox_OCT_demo.npz,3.704594373703003
+2DBox_US_demo.npz,2.0532946586608887
+3DBox_CT_demo.npz,8.557647466659546
+3DBox_MR_demo.npz,61.15630078315735
