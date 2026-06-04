@@ -14,3 +14,14 @@ from .build_sam import (
 )
 from .predictor import SamPredictor
 from .automatic_mask_generator import SamAutomaticMaskGenerator
+from .build_sam import (
+    build_sam_vit_b,
+    build_sam_vit_l,
+    build_sam_vit_h,
+    build_sam_sdf,
+)
+
+from .modeling.sam import Sam
+from .predictor import SamPredictor
+
+__version__ = "1.0"

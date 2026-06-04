@@ -1,190 +1,97 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 import torch
-from torch import nn
-from torch.nn import functional as F
+import torch.nn as nn
+import torch.nn.functional as F
+from .prompt_encoder import PositionEmbedding3D
+MaskDecoder = None
 
-from typing import List, Tuple, Type
-
-from .common import LayerNorm2d
-
-
-class MaskDecoder(nn.Module):
-    def __init__(
-        self,
-        *,
-        transformer_dim: int,
-        transformer: nn.Module,
-        num_multimask_outputs: int = 3,
-        activation: Type[nn.Module] = nn.GELU,
-        iou_head_depth: int = 3,
-        iou_head_hidden_dim: int = 256,
-    ) -> None:
-        """
-        Predicts masks given an image and prompt embeddings, using a
-        transformer architecture.
-
-        Arguments:
-          transformer_dim (int): the channel dimension of the transformer
-          transformer (nn.Module): the transformer used to predict masks
-          num_multimask_outputs (int): the number of masks to predict
-            when disambiguating masks
-          activation (nn.Module): the type of activation to use when
-            upscaling masks
-          iou_head_depth (int): the depth of the MLP used to predict
-            mask quality
-          iou_head_hidden_dim (int): the hidden dimension of the MLP
-            used to predict mask quality
-        """
+# ====================== 全新模块1：多切片特征融合（修复框提示维度BUG） ======================
+class SliceFeatureFusion(nn.Module):
+    def __init__(self, embed_dim=256):
         super().__init__()
-        self.transformer_dim = transformer_dim
-        self.transformer = transformer
+        self.attn = nn.MultiheadAttention(embed_dim, 8, batch_first=True)
+        self.norm = nn.LayerNorm(embed_dim)
 
-        self.num_multimask_outputs = num_multimask_outputs
+    def forward(self, slice_feat, prompt_feat):
+        """
+        适配两种输入模式：
+        1. 无提示/点提示：prompt_feat [B, N_slices, 256]
+        2. 框提示：自动适配维度，统一输出 [B, N_slices, 256]
+        """
+        B, N_slices, C, H, W = slice_feat.shape
+        # 图像特征扁平化：[B, N_slices, H*W, C]
+        slice_feat_flat = slice_feat.flatten(3).transpose(2, 3)
 
-        self.iou_token = nn.Embedding(1, transformer_dim)
-        self.num_mask_tokens = num_multimask_outputs + 1
-        self.mask_tokens = nn.Embedding(self.num_mask_tokens, transformer_dim)
+        # 核心修复：统一框/点/空提示特征维度
+        if len(prompt_feat.shape) == 4:
+            # 框提示输出: [B, N_slices, 1, C] -> 压缩匹配维度
+            prompt_feat = prompt_feat.squeeze(2)
 
-        self.output_upscaling = nn.Sequential(
-            nn.ConvTranspose2d(
-                transformer_dim, transformer_dim // 4, kernel_size=2, stride=2
-            ),
-            LayerNorm2d(transformer_dim // 4),
-            activation(),
-            nn.ConvTranspose2d(
-                transformer_dim // 4, transformer_dim // 8, kernel_size=2, stride=2
-            ),
-            activation(),
+        # 注意力融合
+        fused_feat, _ = self.attn(prompt_feat, slice_feat_flat, slice_feat_flat)
+        fused_feat = self.norm(fused_feat)
+        return fused_feat
+
+# ====================== 全新模块2：2D-3D跨维度特征融合 ======================
+class FeatureFusion(nn.Module):
+    def __init__(self, embed_dim=256):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.ReLU(),
+            nn.LayerNorm(embed_dim)
         )
-        self.output_hypernetworks_mlps = nn.ModuleList(
-            [
-                MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3)
-                for i in range(self.num_mask_tokens)
-            ]
+
+    def forward(self, slice_fused_feat, pos3d_feat):
+        # 拼接2D切片特征与3D位置特征
+        concat_feat = torch.cat([slice_fused_feat, pos3d_feat], dim=-1)
+        return self.fc(concat_feat)
+
+# ====================== 全新模块3：SDF回归预测头 ======================
+class SDFPredictor(nn.Module):
+    def __init__(self, embed_dim=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)  # 输出单通道连续SDF值
         )
 
-        self.iou_prediction_head = MLP(
-            transformer_dim, iou_head_hidden_dim, self.num_mask_tokens, iou_head_depth
-        )
+    def forward(self, fused_feat):
+        return self.mlp(fused_feat).squeeze(-1)
+
+# ====================== 核心：SDF解码器（修复后完整可用） ======================
+class SDFDecoder(nn.Module):
+    def __init__(self, embed_dim=256):
+        super().__init__()
+        self.slice_fusion = SliceFeatureFusion(embed_dim)
+        self.pos3d_encoder = PositionEmbedding3D(embed_dim)
+        self.feat_fusion = FeatureFusion(embed_dim)
+        self.sdf_predictor = SDFPredictor(embed_dim)
 
     def forward(
         self,
-        image_embeddings: torch.Tensor,
-        image_pe: torch.Tensor,
-        sparse_prompt_embeddings: torch.Tensor,
-        dense_prompt_embeddings: torch.Tensor,
-        multimask_output: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Predict masks given image and prompt embeddings.
+        slice_embeddings,
+        slice_pe,
+        sparse_prompt_embeds,
+        query_points,
+        slice_z_positions,
+        img_size
+    ):
+        B, N_slices = slice_embeddings.shape[:2]
+        N_query = query_points.shape[1]
 
-        Arguments:
-          image_embeddings (torch.Tensor): the embeddings from the image encoder
-          image_pe (torch.Tensor): positional encoding with the shape of image_embeddings
-          sparse_prompt_embeddings (torch.Tensor): the embeddings of the points and boxes
-          dense_prompt_embeddings (torch.Tensor): the embeddings of the mask inputs
-          multimask_output (bool): Whether to return multiple masks or a single
-            mask.
+        # 1. 多切片特征+提示特征融合（自动适配点/框/空提示维度）
+        slice_fused = self.slice_fusion(slice_embeddings, sparse_prompt_embeds)
 
-        Returns:
-          torch.Tensor: batched predicted masks
-          torch.Tensor: batched predictions of mask quality
-        """
-        masks, iou_pred = self.predict_masks(
-            image_embeddings=image_embeddings,
-            image_pe=image_pe,
-            sparse_prompt_embeddings=sparse_prompt_embeddings,
-            dense_prompt_embeddings=dense_prompt_embeddings,
-        )
+        # 2. 生成3D查询点位置特征
+        pos3d_feat = self.pos3d_encoder(query_points, img_size)  # [B, N_query, C]
 
-        # Select the correct mask or masks for output
-        if multimask_output:
-            mask_slice = slice(1, None)
-        else:
-            mask_slice = slice(0, 1)
-        masks = masks[:, mask_slice, :, :]
-        iou_pred = iou_pred[:, mask_slice]
+        # 3. 维度适配：切片全局特征匹配所有查询点
+        slice_fused = slice_fused.mean(dim=1, keepdim=True).repeat(1, N_query, 1)
+        total_fused = self.feat_fusion(slice_fused, pos3d_feat)
 
-        # Prepare output
-        return masks, iou_pred
-
-    def predict_masks(
-        self,
-        image_embeddings: torch.Tensor,
-        image_pe: torch.Tensor,
-        sparse_prompt_embeddings: torch.Tensor,
-        dense_prompt_embeddings: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predicts masks. See 'forward' for more details."""
-        # Concatenate output tokens
-        output_tokens = torch.cat(
-            [self.iou_token.weight, self.mask_tokens.weight], dim=0
-        )
-        output_tokens = output_tokens.unsqueeze(0).expand(
-            sparse_prompt_embeddings.size(0), -1, -1
-        )
-        tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
-
-        # Expand per-image data in batch direction to be per-mask
-        if image_embeddings.shape[0] != tokens.shape[0]:
-            src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
-        else:
-            src = image_embeddings
-        src = src + dense_prompt_embeddings
-        pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
-        b, c, h, w = src.shape
-
-        # Run the transformer
-        hs, src = self.transformer(src, pos_src, tokens)
-        iou_token_out = hs[:, 0, :]
-        mask_tokens_out = hs[:, 1 : (1 + self.num_mask_tokens), :]
-
-        # Upscale mask embeddings and predict masks using the mask tokens
-        src = src.transpose(1, 2).view(b, c, h, w)
-        upscaled_embedding = self.output_upscaling(src)
-        hyper_in_list: List[torch.Tensor] = []
-        for i in range(self.num_mask_tokens):
-            hyper_in_list.append(
-                self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])
-            )
-        hyper_in = torch.stack(hyper_in_list, dim=1)
-        b, c, h, w = upscaled_embedding.shape
-        masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
-
-        # Generate mask quality predictions
-        iou_pred = self.iou_prediction_head(iou_token_out)
-
-        return masks, iou_pred
-
-
-# Lightly adapted from
-# https://github.com/facebookresearch/MaskFormer/blob/main/mask_former/modeling/transformer/transformer_predictor.py # noqa
-class MLP(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-        num_layers: int,
-        sigmoid_output: bool = False,
-    ) -> None:
-        super().__init__()
-        self.num_layers = num_layers
-        h = [hidden_dim] * (num_layers - 1)
-        self.layers = nn.ModuleList(
-            nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim])
-        )
-        self.sigmoid_output = sigmoid_output
-
-    def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-        if self.sigmoid_output:
-            x = F.sigmoid(x)
-        return x
+        # 4. 回归SDF预测值
+        sdf_pred = self.sdf_predictor(total_fused)
+        return sdf_pred

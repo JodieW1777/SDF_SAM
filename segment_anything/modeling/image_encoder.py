@@ -56,21 +56,21 @@ class ImageEncoderViT(nn.Module):
         super().__init__()
         self.img_size = img_size
 
-        self.patch_embed = PatchEmbed(
-            kernel_size=(patch_size, patch_size),
-            stride=(patch_size, patch_size),
+        self.patch_embed = PatchEmbed(#切块，将图像切分为 patch 并映射到高维空间
+            kernel_size=(patch_size, patch_size),#卷积核=patch大小
+            stride=(patch_size, patch_size),#步长=patch大小
             in_chans=in_chans,
             embed_dim=embed_dim,
-        )
+        )#(B, 64, 64, 768)
 
-        self.pos_embed: Optional[nn.Parameter] = None
+        self.pos_embed: Optional[nn.Parameter] = None#位置编码。可选择
         if use_abs_pos:
             # Initialize absolute positional embedding with pretrain image size.
             self.pos_embed = nn.Parameter(
                 torch.zeros(
                     1, img_size // patch_size, img_size // patch_size, embed_dim
                 )
-            )
+            )#(1, 64, 64, 768)所有图共享
 
         self.blocks = nn.ModuleList()
         for i in range(depth):

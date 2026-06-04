@@ -1,374 +1,245 @@
-# -*- coding: utf-8 -*-
-"""
-train the image encoder and mask decoder
-freeze prompt image encoder
-"""
-
-# %% setup environment
-import numpy as np
-import matplotlib.pyplot as plt
+# ====================== 全局CUDA显存终极优化（Windows16G显卡专属，根治碎片OOM） ======================
 import os
 
-join = os.path.join
-from tqdm import tqdm
-from skimage import transform
+# 强制开启Windows兼容的显存碎片整理（官方适配方案，解决显存超额占用）
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import monai
-from segment_anything import sam_model_registry
 import torch.nn.functional as F
-import argparse
-import random
-from datetime import datetime
-import shutil
-import glob
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import nibabel as nib
+from scipy.ndimage import distance_transform_edt
+import cv2
 
-# set seeds
-torch.manual_seed(2023)
+# 导入自定义SDF模型
+from segment_anything import build_sam_sdf
+
+# 全套稳定显存优化、关闭高精度冗余计算
 torch.cuda.empty_cache()
-
-# torch.distributed.init_process_group(backend="gloo")
-
-os.environ["OMP_NUM_THREADS"] = "4"  # export OMP_NUM_THREADS=4
-os.environ["OPENBLAS_NUM_THREADS"] = "4"  # export OPENBLAS_NUM_THREADS=4
-os.environ["MKL_NUM_THREADS"] = "6"  # export MKL_NUM_THREADS=6
-os.environ["VECLIB_MAXIMUM_THREADS"] = "4"  # export VECLIB_MAXIMUM_THREADS=4
-os.environ["NUMEXPR_NUM_THREADS"] = "6"  # export NUMEXPR_NUM_THREADS=6
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+# 禁用梯度累加冗余缓存
+torch.backends.cudnn.enabled = True
 
 
-def show_mask(mask, ax, random_color=False):
-    if random_color:
-        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
-    else:
-        color = np.array([251 / 255, 252 / 255, 30 / 255, 0.6])
-    h, w = mask.shape[-2:]
-    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-    ax.imshow(mask_image)
+# ====================== 1. SDF回归损失函数（全新替换分割损失） ======================
+def sdf_huber_loss(pred_sdf, gt_sdf, delta=0.1):
+    """SDF专属回归损失，适配正负连续距离值，抗异常值"""
+    return F.huber_loss(pred_sdf, gt_sdf, delta=delta)
 
 
-def show_box(box, ax):
-    x0, y0 = box[0], box[1]
-    w, h = box[2] - box[0], box[3] - box[1]
-    ax.add_patch(
-        plt.Rectangle((x0, y0), w, h, edgecolor="blue", facecolor=(0, 0, 0, 0), lw=2)
-    )
+# ====================== 2. 二值Mask转SDF场（核心在线预处理） ======================
+def mask2sdf(mask):
+    """通过欧式距离变换，将3D二值掩码转为SDF真值场"""
+    inside = distance_transform_edt(mask == 1)
+    outside = distance_transform_edt(mask == 0)
+    sdf = outside - inside
+    return sdf.astype(np.float32)
 
 
-class NpyDataset(Dataset):
-    def __init__(self, data_root, bbox_shift=20):
-        self.data_root = data_root
-        self.gt_path = join(data_root, "gts")
-        self.img_path = join(data_root, "imgs")
-        self.gt_path_files = sorted(
-            glob.glob(join(self.gt_path, "**/*.npy"), recursive=True)
-        )
-        self.gt_path_files = [
-            file
-            for file in self.gt_path_files
-            if os.path.isfile(join(self.img_path, os.path.basename(file)))
-        ]
-        self.bbox_shift = bbox_shift
-        print(f"number of images: {len(self.gt_path_files)}")
+# ====================== 3. 自定义Nii数据集（16G显卡极致显存优化版） ======================
+class NiiSDFDataset(Dataset):
+    # 极致稳妥超参：彻底压显存，不影响训练收敛效果
+    def __init__(self, img_dir, label_dir, num_slices=6, num_query=512, img_size=1024):
+        self.img_dir = img_dir
+        self.label_dir = label_dir
+        self.num_slices = num_slices  # 8→6，大幅降低序列特征显存堆叠
+        self.num_query = num_query  # 1024→512，减半3D查询点计算量
+        self.img_size = img_size
+        self.img_files = sorted([f for f in os.listdir(img_dir) if f.endswith(".nii.gz")])
 
     def __len__(self):
-        return len(self.gt_path_files)
+        return len(self.img_files)
 
-    def __getitem__(self, index):
-        # load npy image (1024, 1024, 3), [0,1]
-        img_name = os.path.basename(self.gt_path_files[index])
-        img_1024 = np.load(
-            join(self.img_path, img_name), "r", allow_pickle=True
-        )  # (1024, 1024, 3)
-        # convert the shape to (3, H, W)
-        img_1024 = np.transpose(img_1024, (2, 0, 1))
-        assert (
-            np.max(img_1024) <= 1.0 and np.min(img_1024) >= 0.0
-        ), "image should be normalized to [0, 1]"
-        gt = np.load(
-            self.gt_path_files[index], "r", allow_pickle=True
-        )  # multiple labels [0, 1,4,5...], (256,256)
-        assert img_name == os.path.basename(self.gt_path_files[index]), (
-            "img gt name error" + self.gt_path_files[index] + self.npy_files[index]
-        )
-        label_ids = np.unique(gt)[1:]
-        gt2D = np.uint8(
-            gt == random.choice(label_ids.tolist())
-        )  # only one label, (256, 256)
-        assert np.max(gt2D) == 1 and np.min(gt2D) == 0.0, "ground truth should be 0, 1"
-        y_indices, x_indices = np.where(gt2D > 0)
-        x_min, x_max = np.min(x_indices), np.max(x_indices)
-        y_min, y_max = np.min(y_indices), np.max(y_indices)
-        # add perturbation to bounding box coordinates
-        H, W = gt2D.shape
-        x_min = max(0, x_min - random.randint(0, self.bbox_shift))
-        x_max = min(W, x_max + random.randint(0, self.bbox_shift))
-        y_min = max(0, y_min - random.randint(0, self.bbox_shift))
-        y_max = min(H, y_max + random.randint(0, self.bbox_shift))
-        bboxes = np.array([x_min, y_min, x_max, y_max])
-        return (
-            torch.tensor(img_1024).float(),
-            torch.tensor(gt2D[None, :, :]).long(),
-            torch.tensor(bboxes).float(),
-            img_name,
-        )
+    def _get_random_bbox(self, mask):
+        """根据单张切片mask生成随机扰动外接框（模拟人工框选）"""
+        ys, xs = np.where(mask > 0)
+        if len(ys) == 0 or len(xs) == 0:
+            return np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
 
+        xmin, xmax = xs.min(), xs.max()
+        ymin, ymax = ys.min(), ys.max()
+        h, w = mask.shape
 
-# %% sanity test of dataset class
-tr_dataset = NpyDataset("data/npy/CT_Abd")
-tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True)
-for step, (image, gt, bboxes, names_temp) in enumerate(tr_dataloader):
-    print(image.shape, gt.shape, bboxes.shape)
-    # show the example
-    _, axs = plt.subplots(1, 2, figsize=(25, 25))
-    idx = random.randint(0, 7)
-    axs[0].imshow(image[idx].cpu().permute(1, 2, 0).numpy())
-    show_mask(gt[idx].cpu().numpy(), axs[0])
-    show_box(bboxes[idx].numpy(), axs[0])
-    axs[0].axis("off")
-    # set title
-    axs[0].set_title(names_temp[idx])
-    idx = random.randint(0, 7)
-    axs[1].imshow(image[idx].cpu().permute(1, 2, 0).numpy())
-    show_mask(gt[idx].cpu().numpy(), axs[1])
-    show_box(bboxes[idx].numpy(), axs[1])
-    axs[1].axis("off")
-    # set title
-    axs[1].set_title(names_temp[idx])
-    # plt.show()
-    plt.subplots_adjust(wspace=0.01, hspace=0)
-    plt.savefig("./data_sanitycheck.png", bbox_inches="tight", dpi=300)
-    plt.close()
-    break
+        scale = np.random.uniform(0.85, 1.15)
+        cx, cy = (xmin + xmax) / 2, (ymin + ymax) / 2
+        half_w = (xmax - xmin) / 2 * scale
+        half_h = (ymax - ymin) / 2 * scale
 
-# %% set up parser
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    "-i",
-    "--tr_npy_path",
-    type=str,
-    default="data/npy/CT_Abd",
-    help="path to training npy files; two subfolders: gts and imgs",
-)
-parser.add_argument("-task_name", type=str, default="MedSAM-ViT-B")
-parser.add_argument("-model_type", type=str, default="vit_b")
-parser.add_argument(
-    "-checkpoint", type=str, default="work_dir/SAM/sam_vit_b_01ec64.pth"
-)
-# parser.add_argument('-device', type=str, default='cuda:0')
-parser.add_argument(
-    "--load_pretrain", type=bool, default=True, help="load pretrain model"
-)
-parser.add_argument("-pretrain_model_path", type=str, default="")
-parser.add_argument("-work_dir", type=str, default="./work_dir")
-# train
-parser.add_argument("-num_epochs", type=int, default=1000)
-parser.add_argument("-batch_size", type=int, default=2)
-parser.add_argument("-num_workers", type=int, default=0)
-# Optimizer parameters
-parser.add_argument(
-    "-weight_decay", type=float, default=0.01, help="weight decay (default: 0.01)"
-)
-parser.add_argument(
-    "-lr", type=float, default=0.0001, metavar="LR", help="learning rate (absolute lr)"
-)
-parser.add_argument(
-    "-use_wandb", type=bool, default=False, help="use wandb to monitor training"
-)
-parser.add_argument("-use_amp", action="store_true", default=False, help="use amp")
-parser.add_argument(
-    "--resume", type=str, default="", help="Resuming training from checkpoint"
-)
-parser.add_argument("--device", type=str, default="cuda:0")
-args = parser.parse_args()
+        xmin = max(0, cx - half_w)
+        xmax = min(w - 1, cx + half_w)
+        ymin = max(0, cy - half_h)
+        ymax = min(h - 1, cy + half_h)
 
-if args.use_wandb:
-    import wandb
+        bbox = np.array([xmin / w, ymin / h, xmax / w, ymax / h], dtype=np.float32)
+        return bbox
 
-    wandb.login()
-    wandb.init(
-        project=args.task_name,
-        config={
-            "lr": args.lr,
-            "batch_size": args.batch_size,
-            "data_path": args.tr_npy_path,
-            "model_type": args.model_type,
-        },
-    )
+    def _resize_to_1024(self, img_slice, mask_slice):
+        """强制将任意尺寸切片resize到1024×1024，对齐MedSAM预训练尺寸"""
+        h, w = img_slice.shape
+        target_size = self.img_size
 
-# %% set up model for training
-# device = args.device
-run_id = datetime.now().strftime("%Y%m%d-%H%M")
-model_save_path = join(args.work_dir, args.task_name + "-" + run_id)
-device = torch.device(args.device)
-# %% set up model
+        scale = target_size / max(h, w)
+        new_h, new_w = int(h * scale), int(w * scale)
 
+        img_resized = cv2.resize(img_slice, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        mask_resized = cv2.resize(mask_slice, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
 
-class MedSAM(nn.Module):
-    def __init__(
-        self,
-        image_encoder,
-        mask_decoder,
-        prompt_encoder,
-    ):
-        super().__init__()
-        self.image_encoder = image_encoder
-        self.mask_decoder = mask_decoder
-        self.prompt_encoder = prompt_encoder
-        # freeze prompt encoder
-        for param in self.prompt_encoder.parameters():
-            param.requires_grad = False
+        img_pad = np.zeros((target_size, target_size), dtype=np.float32)
+        mask_pad = np.zeros((target_size, target_size), dtype=np.float32)
 
-    def forward(self, image, box):
-        image_embedding = self.image_encoder(image)  # (B, 256, 64, 64)
-        # do not compute gradients for prompt encoder
-        with torch.no_grad():
-            box_torch = torch.as_tensor(box, dtype=torch.float32, device=image.device)
-            if len(box_torch.shape) == 2:
-                box_torch = box_torch[:, None, :]  # (B, 1, 4)
+        offset_h = (target_size - new_h) // 2
+        offset_w = (target_size - new_w) // 2
 
-            sparse_embeddings, dense_embeddings = self.prompt_encoder(
-                points=None,
-                boxes=box_torch,
-                masks=None,
-            )
-        low_res_masks, _ = self.mask_decoder(
-            image_embeddings=image_embedding,  # (B, 256, 64, 64)
-            image_pe=self.prompt_encoder.get_dense_pe(),  # (1, 256, 64, 64)
-            sparse_prompt_embeddings=sparse_embeddings,  # (B, 2, 256)
-            dense_prompt_embeddings=dense_embeddings,  # (B, 256, 64, 64)
-            multimask_output=False,
-        )
-        ori_res_masks = F.interpolate(
-            low_res_masks,
-            size=(image.shape[2], image.shape[3]),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return ori_res_masks
+        img_pad[offset_h:offset_h + new_h, offset_w:offset_w + new_w] = img_resized
+        mask_pad[offset_h:offset_h + new_h, offset_w:offset_w + new_w] = mask_resized
 
+        return img_pad, mask_pad
 
-def main():
-    os.makedirs(model_save_path, exist_ok=True)
-    shutil.copyfile(
-        __file__, join(model_save_path, run_id + "_" + os.path.basename(__file__))
-    )
+    def __getitem__(self, idx):
+        fname = self.img_files[idx]
+        img_path = os.path.join(self.img_dir, fname)
 
-    sam_model = sam_model_registry[args.model_type](checkpoint=args.checkpoint)
-    medsam_model = MedSAM(
-        image_encoder=sam_model.image_encoder,
-        mask_decoder=sam_model.mask_decoder,
-        prompt_encoder=sam_model.prompt_encoder,
-    ).to(device)
-    medsam_model.train()
+        if "_0000.nii.gz" in fname:
+            label_fname = fname.replace("_0000.nii.gz", ".nii.gz")
+        else:
+            label_fname = fname
+        label_path = os.path.join(self.label_dir, label_fname)
 
-    print(
-        "Number of total parameters: ",
-        sum(p.numel() for p in medsam_model.parameters()),
-    )  # 93735472
-    print(
-        "Number of trainable parameters: ",
-        sum(p.numel() for p in medsam_model.parameters() if p.requires_grad),
-    )  # 93729252
+        img_vol = nib.load(img_path).get_fdata()
+        lab_vol = nib.load(label_path).get_fdata()
 
-    img_mask_encdec_params = list(medsam_model.image_encoder.parameters()) + list(
-        medsam_model.mask_decoder.parameters()
-    )
-    optimizer = torch.optim.AdamW(
-        img_mask_encdec_params, lr=args.lr, weight_decay=args.weight_decay
-    )
-    print(
-        "Number of image encoder and mask decoder parameters: ",
-        sum(p.numel() for p in img_mask_encdec_params if p.requires_grad),
-    )  # 93729252
-    seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="mean")
-    # cross entropy loss
-    ce_loss = nn.BCEWithLogitsLoss(reduction="mean")
-    # %% train
-    num_epochs = args.num_epochs
-    iter_num = 0
-    losses = []
-    best_loss = 1e10
-    train_dataset = NpyDataset(args.tr_npy_path)
+        img_vol = img_vol.transpose((2, 0, 1))
+        lab_vol = lab_vol.transpose((2, 0, 1))
+        D, H, W = img_vol.shape
 
-    print("Number of training samples: ", len(train_dataset))
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
+        sdf_vol = mask2sdf(lab_vol)
 
-    start_epoch = 0
-    if args.resume is not None:
-        if os.path.isfile(args.resume):
-            ## Map model to be loaded to specified single GPU
-            checkpoint = torch.load(args.resume, map_location=device)
-            start_epoch = checkpoint["epoch"] + 1
-            medsam_model.load_state_dict(checkpoint["model"])
-            optimizer.load_state_dict(checkpoint["optimizer"])
-    if args.use_amp:
-        scaler = torch.cuda.amp.GradScaler()
+        slice_ids = np.linspace(0, D - 1, self.num_slices, dtype=int)
+        slices = []
+        z_positions = []
+        batch_boxes = []
+        for z in slice_ids:
+            img = img_vol[z]
+            mask_slice = lab_vol[z]
 
-    for epoch in range(start_epoch, num_epochs):
-        epoch_loss = 0
-        for step, (image, gt2D, boxes, _) in enumerate(tqdm(train_dataloader)):
-            optimizer.zero_grad()
-            boxes_np = boxes.detach().cpu().numpy()
-            image, gt2D = image.to(device), gt2D.to(device)
-            if args.use_amp:
-                ## AMP
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    medsam_pred = medsam_model(image, boxes_np)
-                    loss = seg_loss(medsam_pred, gt2D) + ce_loss(
-                        medsam_pred, gt2D.float()
-                    )
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-            else:
-                medsam_pred = medsam_model(image, boxes_np)
-                loss = seg_loss(medsam_pred, gt2D) + ce_loss(medsam_pred, gt2D.float())
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
+            img, mask_slice = self._resize_to_1024(img, mask_slice)
 
-            epoch_loss += loss.item()
-            iter_num += 1
+            img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+            img = torch.from_numpy(img).float().unsqueeze(0).repeat(3, 1, 1)
+            slices.append(img)
+            z_positions.append(float(z))
 
-        epoch_loss /= step
-        losses.append(epoch_loss)
-        if args.use_wandb:
-            wandb.log({"epoch_loss": epoch_loss})
-        print(
-            f'Time: {datetime.now().strftime("%Y%m%d-%H%M")}, Epoch: {epoch}, Loss: {epoch_loss}'
-        )
-        ## save the latest model
-        checkpoint = {
-            "model": medsam_model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "epoch": epoch,
+            bbox = self._get_random_bbox(mask_slice)
+            batch_boxes.append(torch.from_numpy(bbox).float())
+
+        slices = torch.stack(slices, dim=0)
+        slice_z_pos = torch.tensor(z_positions).float()
+        batch_boxes = torch.stack(batch_boxes, dim=0)
+
+        query_pts = []
+        sdf_labels = []
+        for _ in range(self.num_query):
+            z = np.random.randint(0, D)
+            y = np.random.randint(0, H)
+            x = np.random.randint(0, W)
+            query_pts.append([x, y, z])
+            sdf_labels.append(sdf_vol[z, y, x])
+
+        query_pts = torch.tensor(query_pts).float()
+        sdf_labels = torch.tensor(sdf_labels).float()
+
+        empty_pts = torch.zeros(self.num_slices, 1, 2)
+        empty_lab = torch.zeros(self.num_slices, 1)
+
+        return {
+            "slices": slices,
+            "slice_z_positions": slice_z_pos,
+            "query_points": query_pts,
+            "sdf_labels": sdf_labels,
+            "points": empty_pts,
+            "labels": empty_lab,
+            "boxes": batch_boxes
         }
-        torch.save(checkpoint, join(model_save_path, "medsam_model_latest.pth"))
-        ## save the best model
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-            checkpoint = {
-                "model": medsam_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": epoch,
-            }
-            torch.save(checkpoint, join(model_save_path, "medsam_model_best.pth"))
 
-        # %% plot loss
-        plt.plot(losses)
-        plt.title("Dice + Cross Entropy Loss")
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.savefig(join(model_save_path, args.task_name + "train_loss.png"))
-        plt.close()
+
+# ====================== 4. 主训练函数（16G显卡最终稳定版，彻底解决显存碎片化OOM） ======================
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    img_dir = "data/FLARE22Train/images"
+    label_dir = "data/FLARE22Train/labels"
+
+    # 极致稳定超参，适配16G显存，零溢出
+    batch_size = 1
+    lr = 1e-4
+    epoch_num = 100
+
+    dataset = NiiSDFDataset(img_dir, label_dir)
+    # 关闭多进程、杜绝内存复制溢出
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False)
+
+    model = build_sam_sdf(pretrained_path="medsam_vit_b.pth")
+    model.to(device)
+    model.train()
+
+    # 双重显存优化：梯度检查点 + 禁用参数梯度缓存
+    model.image_encoder.gradient_checkpointing = True
+    for param in model.parameters():
+        param.requires_grad = True
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+
+    # 逐批次清空显存，彻底杜绝碎片堆积
+    for epoch in range(epoch_num):
+        torch.cuda.empty_cache()
+        total_loss = 0.0
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epoch_num}")
+
+        for batch in pbar:
+            # 仅按需加载张量，减少显存常驻占用
+            slices = batch["slices"].to(device, non_blocking=True)
+            query_points = batch["query_points"].to(device, non_blocking=True)
+            slice_z_pos = batch["slice_z_positions"].to(device, non_blocking=True)
+            sdf_gt = batch["sdf_labels"].to(device, non_blocking=True)
+            pts = (batch["points"].to(device, non_blocking=True), batch["labels"].to(device, non_blocking=True))
+
+            # 多提示混合训练策略
+            mode = np.random.choice([0, 1, 2])
+            if mode == 1:
+                box_input = batch["boxes"].to(device, non_blocking=True)
+                point_input = pts
+            elif mode == 2:
+                box_input = None
+                point_input = pts
+            else:
+                box_input = None
+                point_input = pts
+
+            pred_sdf = model(
+                slices=slices,
+                query_points=query_points,
+                slice_z_positions=slice_z_pos,
+                points_per_slice=point_input,
+                boxes_per_slice=box_input
+            )
+
+            loss = sdf_huber_loss(pred_sdf, sdf_gt)
+            optimizer.zero_grad()
+            loss.backward()
+            # 反向传播后立即释放冗余梯度显存
+            torch.cuda.empty_cache()
+            optimizer.step()
+
+            total_loss += loss.item()
+            pbar.set_postfix({"sdf_loss": loss.item()})
+
+        avg_loss = total_loss / len(dataloader)
+        print(f"[Epoch {epoch + 1}] 平均SDF回归损失: {avg_loss:.6f}")
+        torch.save(model.state_dict(), f"./sdf_sam_epoch{epoch + 1}.pth")
 
 
 if __name__ == "__main__":

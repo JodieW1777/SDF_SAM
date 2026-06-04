@@ -8,6 +8,7 @@ from functools import partial
 from pathlib import Path
 import urllib.request
 import torch
+import torch.nn as nn
 
 from .modeling import (
     ImageEncoderViT,
@@ -50,6 +51,58 @@ def build_sam_vit_b(checkpoint=None):
         checkpoint=checkpoint,
     )
 
+def build_sam_sdf(pretrained_path=None, embed_dim=256):
+    """
+    自定义SDF版SAM模型构建函数
+    替换原生MaskDecoder为SDFDecoder，新增3D位置编码
+    """
+    from .modeling.image_encoder import ImageEncoderViT
+    from .modeling.prompt_encoder import PromptEncoder, PositionEmbedding3D
+    from .modeling.mask_decoder import SDFDecoder
+    from .modeling.sam import Sam
+
+    # 1. 搭建原生Vit-B结构
+    image_encoder = ImageEncoderViT(
+        depth=12,
+        embed_dim=768,
+        num_heads=12,
+        mlp_ratio=4,
+        qkv_bias=True,
+        norm_layer=nn.LayerNorm,
+    )
+    image_embedding_size = (64, 64)
+    input_image_size = (1024, 1024)
+    mask_in_chans = 16
+
+    prompt_encoder = PromptEncoder(
+        embed_dim=embed_dim,
+        image_embedding_size=image_embedding_size,
+        input_image_size=input_image_size,
+        mask_in_chans=mask_in_chans
+    )
+
+    # 2. 关键：使用你改造的SDF解码器
+    sdf_decoder = SDFDecoder(embed_dim=embed_dim)
+
+    # 3. 组装完整SDF-SAM模型
+    model = Sam(
+        image_encoder=image_encoder,
+        prompt_encoder=prompt_encoder,
+        sdf_decoder=sdf_decoder
+    )
+
+    # 4. 加载MedSAM预训练权重（不加载废弃的mask decoder权重）
+    # 4. 加载MedSAM预训练权重（如果文件存在才加载，不存在不报错）
+    if pretrained_path is not None:
+        import os
+        if os.path.exists(pretrained_path):
+            state_dict = torch.load(pretrained_path, map_location="cpu")
+            model.load_state_dict(state_dict, strict=False)
+            print("成功加载 MedSAM 预训练权重！")
+        else:
+            print("未找到预训练权重文件，跳过加载，模型从头训练。")
+
+    return model
 
 sam_model_registry = {
     "default": build_sam_vit_h,
