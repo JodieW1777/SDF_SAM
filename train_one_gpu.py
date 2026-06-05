@@ -137,7 +137,7 @@ class NiiSDFDataset(Dataset):
             bbox = self._get_random_bbox(mask_slice)
             batch_boxes.append(torch.from_numpy(bbox).float())
 
-        slices = torch.stack(slices, dim=0)
+        slices = torch.stack(slices, dim=0)#将多个切片的张量、z 坐标、框坐标堆叠为批量张量：
         slice_z_pos = torch.tensor(z_positions).float()
         batch_boxes = torch.stack(batch_boxes, dim=0)
 
