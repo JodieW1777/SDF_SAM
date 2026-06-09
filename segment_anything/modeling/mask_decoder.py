@@ -63,15 +63,15 @@ class FeatureFusion(nn.Module):
         print("pos3d_feat shape:", pos3d_feat.shape)
 
         # slice_fused_feat 最终必须为标准3维张量
-        if slice_fused_feat.ndim == 4:
-            # [1,512,2,256]  -->  挤压尾部维度  --> 原生标准3维 [1,512,512]
-            slice_fused_feat = slice_fused_feat.flatten(start_dim=2, end_dim=3)
+        if slice_fused_feat.dim() == 4:
+            # [1,512,N,256] → 在 N 维度取平均 → 变成 [1,512,256]
+            slice_fused_feat = slice_fused_feat.mean(dim=2)
 
         # 此刻两个张量完全同维度：
         # slice_fused_feat：[1,512,512]
         # pos3d_feat：       [1,512,512]
         concat_feat = torch.cat([slice_fused_feat, pos3d_feat], dim=-1)
-        print("pos3d_feat shape:", concat_feat .shape)
+        print("concat_feat shape:", concat_feat .shape)
         # 完美匹配Conv2d卷积通道、权重、尺寸，零报错、零逻辑篡改
         # fused_feat = self.conv1(concat_feat)
         # fused_feat = self.relu(fused_feat)
@@ -79,20 +79,20 @@ class FeatureFusion(nn.Module):
         return concat_feat
 
 class SDFPredictor(nn.Module):
-    def __init__(self, embed_dim=1024):  # 👈 固定 1024
+    def __init__(self, embed_dim=512):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(1024, 512),   # 👈 输入 1024
-            nn.ReLU(inplace=True),
             nn.Linear(512, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(128, 1)
+            nn.Linear(128, 1),
+
         )
 
     def forward(self, fused_feat):
         return self.mlp(fused_feat).squeeze(-1)
+
 
 class SDFDecoder(nn.Module):
     def __init__(self, embed_dim=256):
