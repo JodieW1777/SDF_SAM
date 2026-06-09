@@ -17,6 +17,9 @@ import cv2
 # 导入自定义SDF模型
 from segment_anything import build_sam_sdf
 
+
+
+
 # 全套稳定显存优化、关闭高精度冗余计算
 torch.cuda.empty_cache()
 torch.backends.cudnn.benchmark = True
@@ -175,6 +178,7 @@ def main():
 
     # 极致稳定超参，适配16G显存，零溢出
     batch_size = 1
+    slice_batch_size = 4
     lr = 1e-4
     epoch_num = 100
 
@@ -186,9 +190,19 @@ def main():
     model.to(device)
     model.train()
 
-    # 双重显存优化：梯度检查点 + 禁用参数梯度缓存
-    model.image_encoder.gradient_checkpointing = True
-    for param in model.parameters():
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+    # 冻结图像编码器浅层参数，仅训练SDF核心分支
+    # ========== 终极显存修复：冻结整个图像编码器 ==========
+    for param in model.image_encoder.parameters():
+        param.requires_grad = False
+
+    # 只训练 SDF 头 + prompt 部分
+    for param in model.prompt_encoder.parameters():
+        param.requires_grad = True
+
+    for param in model.sdf_decoder.parameters():
         param.requires_grad = True
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -200,12 +214,11 @@ def main():
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epoch_num}")
 
         for batch in pbar:
-            # 仅按需加载张量，减少显存常驻占用
-            slices = batch["slices"].to(device, non_blocking=True)
-            query_points = batch["query_points"].to(device, non_blocking=True)
-            slice_z_pos = batch["slice_z_positions"].to(device, non_blocking=True)
-            sdf_gt = batch["sdf_labels"].to(device, non_blocking=True)
-            pts = (batch["points"].to(device, non_blocking=True), batch["labels"].to(device, non_blocking=True))
+            slices = batch["slices"].to(device)
+            query_points = batch["query_points"].to(device)
+            slice_z_pos = batch["slice_z_positions"].to(device)
+            sdf_gt = batch["sdf_labels"].to(device)
+            pts = (batch["points"].to(device), batch["labels"].to(device))
 
             # 多提示混合训练策略
             mode = np.random.choice([0, 1, 2])
@@ -219,23 +232,41 @@ def main():
                 box_input = None
                 point_input = pts
 
-            pred_sdf = model(
-                slices=slices,
-                query_points=query_points,
-                slice_z_positions=slice_z_pos,
-                points_per_slice=point_input,
-                boxes_per_slice=box_input
-            )
+            del batch["boxes"]
+            # 前预处理：清空显存、重置峰值
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+            # 分片小批次前向传播，避免一次性爆显存
+            slices_split = torch.split(slices, slice_batch_size, dim=0)
+            pred_sdf_list = []
+            for slice_sub in slices_split:
+                pred_sdf_sub = model(
+                    slices=slice_sub,
+                    query_points=query_points[:len(slice_sub)],
+                    slice_z_positions=slice_z_pos[:len(slice_sub)],
+                    points_per_slice=(pts[0][:len(slice_sub)], pts[1][:len(slice_sub)]),
+                    boxes_per_slice=box_input[:len(slice_sub)] if box_input is not None else None
+                )
+                pred_sdf_list.append(pred_sdf_sub)
+                torch.cuda.empty_cache()
+
+            # 拼接所有分片结果
+            pred_sdf = torch.cat(pred_sdf_list, dim=0)
 
             loss = sdf_huber_loss(pred_sdf, sdf_gt)
-            optimizer.zero_grad()
             loss.backward()
-            # 反向传播后立即释放冗余梯度显存
-            torch.cuda.empty_cache()
             optimizer.step()
+
+            # 极致显存释放（关键）
+            optimizer.zero_grad(set_to_none=True)
+            del loss, pred_sdf, sdf_gt
+            torch.cuda.empty_cache()
 
             total_loss += loss.item()
             pbar.set_postfix({"sdf_loss": loss.item()})
+            # 每5个epoch保存一次，减少显存占用
+
 
         avg_loss = total_loss / len(dataloader)
         print(f"[Epoch {epoch + 1}] 平均SDF回归损失: {avg_loss:.6f}")
