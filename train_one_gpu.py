@@ -238,16 +238,34 @@ def main():
             torch.cuda.reset_peak_memory_stats()
 
             # 分片小批次前向传播，避免一次性爆显存
+            # slices_split = torch.split(slices, slice_batch_size, dim=0)
+            # pred_sdf_list = []
+            # for slice_sub in slices_split:
+            #     pred_sdf_sub = model(
+            #         slices=slice_sub,
+            #         query_points=query_points[:len(slice_sub)],
+            #         slice_z_positions=slice_z_pos[:len(slice_sub)],
+            #         points_per_slice=(pts[0][:len(slice_sub)], pts[1][:len(slice_sub)]),
+            #         boxes_per_slice=box_input[:len(slice_sub)] if box_input is not None else None
+            #     )
+            #     pred_sdf_list.append(pred_sdf_sub)
+            #     torch.cuda.empty_cache()
+            # 分片小批次前向传播，避免一次性爆显存
             slices_split = torch.split(slices, slice_batch_size, dim=0)
             pred_sdf_list = []
-            for slice_sub in slices_split:
+            for idx, slice_sub in enumerate(slices_split):
+                # 精准计算分片索引，避免维度错位
+                start_idx = idx * slice_batch_size
+                end_idx = start_idx + len(slice_sub)
+
                 pred_sdf_sub = model(
                     slices=slice_sub,
-                    query_points=query_points[:len(slice_sub)],
-                    slice_z_positions=slice_z_pos[:len(slice_sub)],
-                    points_per_slice=(pts[0][:len(slice_sub)], pts[1][:len(slice_sub)]),
-                    boxes_per_slice=box_input[:len(slice_sub)] if box_input is not None else None
+                    query_points=query_points[start_idx:end_idx],
+                    slice_z_positions=slice_z_pos[start_idx:end_idx],
+                    points_per_slice=(pts[0][start_idx:end_idx], pts[1][start_idx:end_idx]),
+                    boxes_per_slice=box_input[start_idx:end_idx] if box_input is not None else None
                 )
+
                 pred_sdf_list.append(pred_sdf_sub)
                 torch.cuda.empty_cache()
 
@@ -258,13 +276,29 @@ def main():
             loss.backward()
             optimizer.step()
 
+            # 先获取loss值，再删除变量（修复NameError）
+            loss_val = loss.item()
+            total_loss += loss_val
+            pbar.set_postfix({"sdf_loss": loss_val})
+
             # 极致显存释放（关键）
             optimizer.zero_grad(set_to_none=True)
-            del loss, pred_sdf, sdf_gt
+            del loss, pred_sdf, sdf_gt, loss_val  # 清理所有临时变量
             torch.cuda.empty_cache()
-
-            total_loss += loss.item()
-            pbar.set_postfix({"sdf_loss": loss.item()})
+            # 拼接所有分片结果
+            # pred_sdf = torch.cat(pred_sdf_list, dim=0)
+            #
+            # loss = sdf_huber_loss(pred_sdf, sdf_gt)
+            # loss.backward()
+            # optimizer.step()
+            #
+            # # 极致显存释放（关键）
+            # optimizer.zero_grad(set_to_none=True)
+            # del loss, pred_sdf, sdf_gt
+            # torch.cuda.empty_cache()
+            #
+            # total_loss += loss.item()
+            # pbar.set_postfix({"sdf_loss": loss.item()})
             # 每5个epoch保存一次，减少显存占用
 
 
