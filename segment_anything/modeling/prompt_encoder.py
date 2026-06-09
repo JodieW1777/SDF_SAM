@@ -257,7 +257,7 @@ class PositionEmbedding3D(nn.Module):# 给任意3D点P=(x,y,z)生成位置编码
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim * 2)
         ) # 拼接x,y,z编码后，映射到和SAM embed_dim一致的维度（默认256）
-        self.out_proj = nn.Linear(embed_dim * 4, embed_dim * 2)
+        self.out_proj = nn.Linear(embed_dim * 4, embed_dim )
 
     def forward(self, points_3d: torch.Tensor, img_size: Tuple[int, int]) -> torch.Tensor:
         """
