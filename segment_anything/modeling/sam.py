@@ -81,7 +81,7 @@ class Sam(nn.Module):
         sparse_prompt_embeds = []
         for i in range(N_slices):
             points = (points_per_slice[0][:, i], points_per_slice[1][:, i]) if points_per_slice else None
-            boxes = boxes_per_slice[:, i] if boxes_per_slice else None
+            boxes = boxes_per_slice[:, i] if boxes_per_slice is not None else None
             sparse_emb, _ = self.prompt_encoder(points=points, boxes=boxes, masks=None)
             sparse_prompt_embeds.append(sparse_emb)
         sparse_prompt_embeds = torch.stack(sparse_prompt_embeds, dim=1)
