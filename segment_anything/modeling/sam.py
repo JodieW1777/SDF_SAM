@@ -61,7 +61,17 @@ class Sam(nn.Module):
         img_size = (H, W)
 
         # 1. 批量编码所有切片图像特征
-        slices_processed = self.image_encoder(slices.reshape(-1, 3, slices.shape[-2], slices.shape[-1]))
+        # 分片处理切片，避免单次超大张量输入编码器
+        slices_reshaped = slices.reshape(-1, 3, slices.shape[-2], slices.shape[-1])
+        slices_reshaped_split = torch.split(slices_reshaped, 8, dim=0)
+        slices_processed_list = []
+        for sub_tensor in slices_reshaped_split:
+            sub_processed = self.image_encoder(sub_tensor)
+            slices_processed_list.append(sub_processed)
+            del sub_tensor
+            torch.cuda.empty_cache()
+        slices_processed = torch.cat(slices_processed_list, dim=0)
+
         slice_embeddings = slices_processed.reshape(B, N_slices, -1, slices_processed.shape[-2], slices_processed.shape[-1])
 
         # 2. 获取切片位置编码
