@@ -104,7 +104,9 @@ class SDFDecoder(nn.Module):
 
         # 2. 多切片局部特征 -> 全局特征聚合（自研增量创新）
         global_slice_feat = slice_local_feat.mean(dim=1, keepdim=True)
-        global_slice_feat = global_slice_feat.repeat(1, N_query, 1)
+        # mask_decoder.py 中 forward 函数内，repeat 行之前
+        print("global_slice_feat shape:", global_slice_feat.shape)  # 打印维度
+        global_slice_feat = global_slice_feat.repeat(1, N_query, 1, 1)
 
         # 3. 3D位置编码 & 跨维度融合
         pos3d_feat = self.pos3d_encoder(query_points, img_size)
