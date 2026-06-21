@@ -40,26 +40,28 @@ class Sam(nn.Module):
 
     # 完全重写forward前向传播（核心改造）
     def forward(
-        self,
-        slices: torch.Tensor,
-        query_points: torch.Tensor,
-        slice_z_positions: torch.Tensor,
-        points_per_slice: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        boxes_per_slice: Optional[torch.Tensor] = None,
+            self,
+            slices: torch.Tensor,
+            query_points: torch.Tensor,
+            slice_z_positions: torch.Tensor,
+            points_per_slice: Tuple[torch.Tensor, torch.Tensor],
+            boxes_per_slice: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        SDF-SAM前向传播：多切片编码+3D坐标融合+SDF回归
-        输入：多稀疏切片、3D查询坐标、切片Z轴空间坐标、可选prompt
-        输出：所有3D查询点的SDF连续预测值
-        """
-        # 获取批次与切片数量
-        B, N_slices = slices.shape[:2]
-
+        # =====================新增兼容4维多切片逻辑【核心修改1】=====================
+        # 判断输入是4维：[N_slices, 3, H, W] 代表 1个病人、多张切片，无Batch维度
+        if slices.dim() == 4:
+            N_slices = slices.shape[0]
+            B = 1
+            # 在第0维新增Batch维度，4维→5维 [1, N_slices, 3, H, W]
+            slices = slices.unsqueeze(0)
+        else:
+            # 原生训练5维输入 [B, N_slices, 3, H, W]，正常解包
+            B, N_slices = slices.shape[:2]
+        # =========================================================================
         # 【自动计算图像尺寸，不再写死1024！！】
         # slices shape: [B, N_slices, 3, H, W]
         H, W = slices.shape[-2], slices.shape[-1]
         img_size = (H, W)
-
         # 1. 批量编码所有切片图像特征
         # 分片处理切片，避免单次超大张量输入编码器
         slices_reshaped = slices.reshape(-1, 3, slices.shape[-2], slices.shape[-1])
@@ -71,9 +73,20 @@ class Sam(nn.Module):
             del sub_tensor
             torch.cuda.empty_cache()
         slices_processed = torch.cat(slices_processed_list, dim=0)
+        slice_embeddings = slices_processed.reshape(B, N_slices, -1, slices_processed.shape[-2],slices_processed.shape[-1])
 
-        slice_embeddings = slices_processed.reshape(B, N_slices, -1, slices_processed.shape[-2], slices_processed.shape[-1])
-
+        if B == 1:
+            # z坐标 [N_slices] -> [1, N_slices]
+            slice_z_positions = slice_z_positions.unsqueeze(0)
+            # 框张量 [N_slices,4] -> [1, N_slices,4]
+            boxes_per_slice = boxes_per_slice.unsqueeze(0)
+            # 提示点 (坐标,标签) 分别补batch
+            pts0, pts1 = points_per_slice
+            pts0 = pts0.unsqueeze(0)
+            pts1 = pts1.unsqueeze(0)
+            points_per_slice = (pts0, pts1)
+            # 查询点 [N_slices, N_query, 3] -> [1, N_slices, N_query, 3]
+            query_points = query_points.unsqueeze(0)
         # 2. 获取切片位置编码
         slice_pe = self.prompt_encoder.get_dense_pe().unsqueeze(1).repeat(B, N_slices, 1, 1, 1)
 
@@ -98,38 +111,38 @@ class Sam(nn.Module):
 
         return sdf_pred
 
-    def postprocess_masks(
-        self,
-        masks: torch.Tensor,
-        input_size: Tuple[int, ...],
-        original_size: Tuple[int, ...],
-    ) -> torch.Tensor:
-        """
-        Remove padding and upscale masks to the original image size.
-
-        Arguments:
-          masks (torch.Tensor): Batched masks from the mask_decoder,
-            in BxCxHxW format.
-          input_size (tuple(int, int)): The size of the image input to the
-            model, in (H, W) format. Used to remove padding.
-          original_size (tuple(int, int)): The original size of the image
-            before resizing for input to the model, in (H, W) format.
-
-        Returns:
-          (torch.Tensor): Batched masks in BxCxHxW format, where (H, W)
-            is given by original_size.
-        """
-        masks = F.interpolate(
-            masks,
-            (self.image_encoder.img_size, self.image_encoder.img_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-        masks = masks[..., : input_size[0], : input_size[1]]
-        masks = F.interpolate(
-            masks, original_size, mode="bilinear", align_corners=False
-        )
-        return masks
+    # def postprocess_masks(
+    #     self,
+    #     masks: torch.Tensor,
+    #     input_size: Tuple[int, ...],
+    #     original_size: Tuple[int, ...],
+    # ) -> torch.Tensor:
+    #     """
+    #     Remove padding and upscale masks to the original image size.
+    #
+    #     Arguments:
+    #       masks (torch.Tensor): Batched masks from the mask_decoder,
+    #         in BxCxHxW format.
+    #       input_size (tuple(int, int)): The size of the image input to the
+    #         model, in (H, W) format. Used to remove padding.
+    #       original_size (tuple(int, int)): The original size of the image
+    #         before resizing for input to the model, in (H, W) format.
+    #
+    #     Returns:
+    #       (torch.Tensor): Batched masks in BxCxHxW format, where (H, W)
+    #         is given by original_size.
+    #     """
+    #     masks = F.interpolate(
+    #         masks,
+    #         (self.image_encoder.img_size, self.image_encoder.img_size),
+    #         mode="bilinear",
+    #         align_corners=False,
+    #     )
+    #     masks = masks[..., : input_size[0], : input_size[1]]
+    #     masks = F.interpolate(
+    #         masks, original_size, mode="bilinear", align_corners=False
+    #     )
+    #     return masks
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize pixel values and pad to a square input."""
