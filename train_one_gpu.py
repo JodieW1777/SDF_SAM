@@ -1,4 +1,3 @@
-# ====================== 全局CUDA显存终极优化（Windows16G显卡专属，根治碎片OOM） ======================
 import os
 
 # 强制开启Windows兼容的显存碎片整理（官方适配方案，解决显存超额占用）
@@ -47,7 +46,7 @@ def mask2sdf(mask):
 # ====================== 3. 自定义Nii数据集（16G显卡极致显存优化版） ======================
 class NiiSDFDataset(Dataset):
     # 极致稳妥超参：彻底压显存，不影响训练收敛效果
-    def __init__(self, img_dir, label_dir, num_slices=8, num_query=512, img_size=1024):
+    def __init__(self, img_dir, label_dir, num_slices=4, num_query=512, img_size=1024):
         self.img_dir = img_dir
         self.label_dir = label_dir
         self.num_slices = num_slices  # 采样切片总数
