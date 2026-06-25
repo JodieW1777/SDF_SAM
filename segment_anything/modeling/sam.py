@@ -75,21 +75,10 @@ class Sam(nn.Module):
         slices_processed = torch.cat(slices_processed_list, dim=0)
         slice_embeddings = slices_processed.reshape(B, N_slices, -1, slices_processed.shape[-2],slices_processed.shape[-1])
 
-        if B == 1:
-            # z坐标 [N_slices] -> [1, N_slices]
-            slice_z_positions = slice_z_positions.unsqueeze(0)
-            # 框张量 [N_slices,4] -> [1, N_slices,4]
-            boxes_per_slice = boxes_per_slice.unsqueeze(0)
-            # 提示点 (坐标,标签) 分别补batch
-            pts0, pts1 = points_per_slice
-            pts0 = pts0.unsqueeze(0)
-            pts1 = pts1.unsqueeze(0)
-            points_per_slice = (pts0, pts1)
-            # 查询点 [N_slices, N_query, 3] -> [1, N_slices, N_query, 3]
-            query_points = query_points.unsqueeze(0)
         # 2. 获取切片位置编码
         slice_pe = self.prompt_encoder.get_dense_pe().unsqueeze(1).repeat(B, N_slices, 1, 1, 1)
-
+        print("points coords shape:", points_per_slice[0].shape)
+        print("points labels shape:", points_per_slice[1].shape)
         # 3. 逐切片编码prompt特征
         sparse_prompt_embeds = []
         for i in range(N_slices):
@@ -155,4 +144,3 @@ class Sam(nn.Module):
         padw = self.image_encoder.img_size - w
         x = F.pad(x, (0, padw, 0, padh))
         return x
-
