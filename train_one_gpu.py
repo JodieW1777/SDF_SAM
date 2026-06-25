@@ -214,13 +214,7 @@ def main():
             sdf_gt = batch["sdf_labels"].to(device)
             pts = (batch["points"].to(device), batch["labels"].to(device))
 
-            mode = np.random.choice([0, 1, 2])
-            if mode == 1:
-                box_input = batch["boxes"].to(device, non_blocking=True)
-                point_input = pts
-            else:
-                box_input = None
-                point_input = pts
+            box_input = batch["boxes"].to(device, non_blocking=True)
             del batch["boxes"]
 
             torch.cuda.empty_cache()
