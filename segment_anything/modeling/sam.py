@@ -144,3 +144,44 @@ class Sam(nn.Module):
         padw = self.image_encoder.img_size - w
         x = F.pad(x, (0, padw, 0, padh))
         return x
+
+class CrossSliceTransformer(nn.Module):
+    def __init__(self, dim, depth=2, heads=8):
+        super().__init__()
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=heads,
+            dim_feedforward=dim * 4,
+            batch_first=True,
+            norm_first=True
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=depth
+        )
+
+        self.pos_emb = nn.Embedding(512, dim)
+
+    def forward(self, x):
+        """
+        x: (B, N, C, H, W)
+        """
+
+        B, N, C, H, W = x.shape
+
+        # 1. spatial pooling (你也可以换成attention pooling)
+        x = x.mean(dim=(-1, -2))   # (B, N, C)
+
+        # 2. slice position encoding
+        pos = torch.arange(N, device=x.device)
+        x = x + self.pos_emb(pos)[None, :, :]
+
+        # 3. transformer
+        x = self.transformer(x)  # (B, N, C)
+
+        # 4. restore spatial broadcast
+        x = x[:, :, :, None, None].expand(-1, -1, -1, H, W)
+
+        return x
