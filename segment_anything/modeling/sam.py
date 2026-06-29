@@ -37,7 +37,11 @@ class Sam(nn.Module):
         self.image_encoder = image_encoder
         self.prompt_encoder = prompt_encoder
         self.sdf_decoder = sdf_decoder  # 核心替换：废弃MaskDecoder
-
+        # self.slice_fusion = CrossSliceTransformer(
+        #     dim=self.image_encoder.embed_dim,
+        #     depth=2,
+        #     heads=8
+        # )
     # 完全重写forward前向传播（核心改造）
     def forward(
             self,
@@ -74,6 +78,8 @@ class Sam(nn.Module):
             torch.cuda.empty_cache()
         slices_processed = torch.cat(slices_processed_list, dim=0)
         slice_embeddings = slices_processed.reshape(B, N_slices, -1, slices_processed.shape[-2],slices_processed.shape[-1])
+        # # Cross-Slice Transformer
+        # slice_embeddings = self.slice_fusion(slice_embeddings)
 
         # 2. 获取切片位置编码
         slice_pe = self.prompt_encoder.get_dense_pe().unsqueeze(1).repeat(B, N_slices, 1, 1, 1)
@@ -92,7 +98,7 @@ class Sam(nn.Module):
         sdf_pred = self.sdf_decoder(
             slice_embeddings=slice_embeddings,
             slice_pe=slice_pe,
-            sparse_prompt_embeds=sparse_prompt_embeds,
+            prompt=sparse_prompt_embeds,
             query_points=query_points,
             slice_z_positions=slice_z_positions,
             img_size=img_size
@@ -145,43 +151,43 @@ class Sam(nn.Module):
         x = F.pad(x, (0, padw, 0, padh))
         return x
 
-class CrossSliceTransformer(nn.Module):
-    def __init__(self, dim, depth=2, heads=8):
-        super().__init__()
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=dim,
-            nhead=heads,
-            dim_feedforward=dim * 4,
-            batch_first=True,
-            norm_first=True
-        )
-
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=depth
-        )
-
-        self.pos_emb = nn.Embedding(512, dim)
-
-    def forward(self, x):
-        """
-        x: (B, N, C, H, W)
-        """
-
-        B, N, C, H, W = x.shape
-
-        # 1. spatial pooling (你也可以换成attention pooling)
-        x = x.mean(dim=(-1, -2))   # (B, N, C)
-
-        # 2. slice position encoding
-        pos = torch.arange(N, device=x.device)
-        x = x + self.pos_emb(pos)[None, :, :]
-
-        # 3. transformer
-        x = self.transformer(x)  # (B, N, C)
-
-        # 4. restore spatial broadcast
-        x = x[:, :, :, None, None].expand(-1, -1, -1, H, W)
-
-        return x
+# class CrossSliceTransformer(nn.Module):
+#     def __init__(self, dim, depth=2, heads=8):
+#         super().__init__()
+#
+#         encoder_layer = nn.TransformerEncoderLayer(
+#             d_model=dim,
+#             nhead=heads,
+#             dim_feedforward=dim * 4,
+#             batch_first=True,
+#             norm_first=True
+#         )
+#
+#         self.transformer = nn.TransformerEncoder(
+#             encoder_layer,
+#             num_layers=depth
+#         )
+#
+#         self.pos_emb = nn.Embedding(512, dim)
+#
+#     def forward(self, x):
+#         """
+#         x: (B, N, C, H, W)
+#         """
+#
+#         B, N, C, H, W = x.shape
+#
+#         # 1. spatial pooling (你也可以换成attention pooling)
+#         x = x.mean(dim=(-1, -2))   # (B, N, C)
+#
+#         # 2. slice position encoding
+#         pos = torch.arange(N, device=x.device)
+#         x = x + self.pos_emb(pos)[None, :, :]
+#
+#         # 3. transformer
+#         x = self.transformer(x)  # (B, N, C)
+#
+#         # 4. restore spatial broadcast
+#         x = x[:, :, :, None, None].expand(-1, -1, -1, H, W)
+#
+#         return x
