@@ -44,21 +44,25 @@ def mask2sdf(mask):
 
 
 # ====================== 3. 自定义Nii数据集（16G显卡极致显存优化版） ======================
-class NiiSDFDataset(Dataset):
-    # 极致稳妥超参：彻底压显存，不影响训练收敛效果
-    def __init__(self, img_dir, label_dir, num_slices=4, num_query=512, img_size=1024):
-        self.img_dir = img_dir
-        self.label_dir = label_dir
-        self.num_slices = num_slices  # 采样切片总数
-        self.num_query = num_query     # 3D查询点数
-        self.img_size = img_size
-        self.img_files = sorted([f for f in os.listdir(img_dir) if f.endswith(".nii.gz")])
+class NpySDFDataset(Dataset):
+    def __init__(self, npy_root, num_slices=4, num_query=512):
+        self.img_dir = os.path.join(npy_root, "imgs")
+        self.gt_dir = os.path.join(npy_root, "gts")
+        self.num_slices = num_slices
+        self.num_query = num_query
+        # 同步匹配图片+mask文件名
+        self.img_names = sorted(os.listdir(self.img_dir))
+        self.valid_pairs = []
+        for name in self.img_names:
+            gt_path = os.path.join(self.gt_dir, name)
+            if os.path.exists(gt_path):
+                self.valid_pairs.append(name)
+        print(f"有效样本总数: {len(self.valid_pairs)}")
 
     def __len__(self):
-        return len(self.img_files)
+        return len(self.valid_pairs)
 
     def _get_random_bbox(self, mask):
-        """根据单张切片mask生成随机扰动外接框（模拟人工框选）"""
         ys, xs = np.where(mask > 0)
         if len(ys) == 0 or len(xs) == 0:
             return np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
@@ -73,67 +77,31 @@ class NiiSDFDataset(Dataset):
         xmax = min(w - 1, cx + half_w)
         ymin = max(0, cy - half_h)
         ymax = min(h - 1, cy + half_h)
-        bbox = np.array([xmin / w, ymin / h, xmax / w, ymax / h], dtype=np.float32)
+        bbox = np.array([xmin / w, ymin / h, xmax / w, ymax], dtype=np.float32)
         return bbox
 
-    def _resize_to_1024(self, img_slice, mask_slice):
-        """强制将任意尺寸切片resize到1024×1024，对齐MedSAM预训练尺寸"""
-        h, w = img_slice.shape
-        target_size = self.img_size
-        scale = target_size / max(h, w)
-        new_h, new_w = int(h * scale), int(w * scale)
-        img_resized = cv2.resize(img_slice, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        mask_resized = cv2.resize(mask_slice, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-        img_pad = np.zeros((target_size, target_size), dtype=np.float32)
-        mask_pad = np.zeros((target_size, target_size), dtype=np.float32)
-        offset_h = (target_size - new_h) // 2
-        offset_w = (target_size - new_w) // 2
-        img_pad[offset_h:offset_h + new_h, offset_w:offset_w + new_w] = img_resized
-        mask_pad[offset_h:offset_h + new_h, offset_w:offset_w + new_w] = mask_resized
-        return img_pad, mask_pad
-
     def __getitem__(self, idx):
-        fname = self.img_files[idx]
-        img_path = os.path.join(self.img_dir, fname)
-        if "_0000.nii.gz" in fname:
-            label_fname = fname.replace("_0000.nii.gz", ".nii.gz")
-        else:
-            label_fname = fname
-        label_path = os.path.join(self.label_dir, label_fname)
+        name = self.valid_pairs[idx]
+        img_path = os.path.join(self.img_dir, name)
+        gt_path = os.path.join(self.gt_dir, name)
+        # pre_CT_MR输出固定(1024,1024,3) [0,1]
+        img_slice = np.load(img_path)
+        mask_slice = np.load(gt_path)
 
-        img_vol = nib.load(img_path).get_fdata()
-        lab_vol = nib.load(label_path).get_fdata()
-        # 转维度: (D, H, W)
-        img_vol = img_vol.transpose((2, 0, 1))
-        lab_vol = lab_vol.transpose((2, 0, 1))
-        D, H, W = img_vol.shape
+        # 这里模拟3D volume逻辑：单切片重复构造虚拟D维度用于SDF采样
+        D = self.num_slices
+        img_vol = np.repeat(img_slice[np.newaxis, ...], D, axis=0)  # D,1024,1024,3
+        lab_vol = np.repeat(mask_slice[np.newaxis, ...], D, axis=0) # D,1024,1024
         sdf_vol = mask2sdf(lab_vol)
 
-        # 在框提示有效范围内均匀提取切片
-        # 步骤1：遍历所有切片，筛选掩码非空、存在有效框】的切片索引
-        valid_slice_ids = []
-        for z in range(D):
-            mask_slice = lab_vol[z]
-            if np.any(mask_slice > 0): # 判断当前切片是否有目标器官
-                valid_slice_ids.append(z)
-
-        if len(valid_slice_ids) >= self.num_slices:
-            # 在有效切片区间内均匀采样
-            slice_ids = np.linspace(0, len(valid_slice_ids)-1, self.num_slices, dtype=int)
-            slice_ids = np.array(valid_slice_ids)[slice_ids]
-        else:
-            # 有效切片数量不足，降级为全局均匀采样
-            slice_ids = np.linspace(0, D - 1, self.num_slices, dtype=int)
-
+        # 均匀采样N张切片
+        slice_ids = np.linspace(0, D-1, self.num_slices, dtype=int)
         slices = []
         z_positions = []
         batch_boxes = []
         for z in slice_ids:
             img = img_vol[z]
-            mask_slice = lab_vol[z]
-            img, mask_slice = self._resize_to_1024(img, mask_slice)
-            img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-            img = torch.from_numpy(img).float().unsqueeze(0).repeat(3, 1, 1)
+            img = torch.from_numpy(img).permute(2,0,1).float() # (3,1024,1024)
             slices.append(img)
             z_positions.append(float(z))
             bbox = self._get_random_bbox(mask_slice)
@@ -143,13 +111,13 @@ class NiiSDFDataset(Dataset):
         slice_z_pos = torch.tensor(z_positions).float()
         batch_boxes = torch.stack(batch_boxes, dim=0)
 
-        # 随机采样3D查询点
+        # 随机3D查询点
         query_pts = []
         sdf_labels = []
         for _ in range(self.num_query):
             z = np.random.randint(0, D)
-            y = np.random.randint(0, H)
-            x = np.random.randint(0, W)
+            y = np.random.randint(0, 1024)
+            x = np.random.randint(0, 1024)
             query_pts.append([x, y, z])
             sdf_labels.append(sdf_vol[z, y, x])
         query_pts = torch.tensor(query_pts).float()
@@ -157,7 +125,6 @@ class NiiSDFDataset(Dataset):
 
         empty_pts = torch.zeros(self.num_slices, 1, 2)
         empty_lab = torch.zeros(self.num_slices, 1)
-
         return {
             "slices": slices,
             "slice_z_positions": slice_z_pos,
@@ -168,16 +135,17 @@ class NiiSDFDataset(Dataset):
             "boxes": batch_boxes
         }
 
+
 # ====================== 4. 主训练函数（16G显卡最终稳定版，彻底解决显存碎片化OOM） ======================
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    img_dir = "data/FLARE22Train/images"
-    label_dir = "data/FLARE22Train/labels"
+    # npy输出根目录，对应pre_CT_MR生成的./npy
+    npy_root = "./data/npy/CT_Abd"
     batch_size = 1
     slice_batch_size = 4
-    lr = 1e-4
+    lr=1e-4
     epoch_num = 100
-    dataset = NiiSDFDataset(img_dir, label_dir)
+    dataset = NpySDFDataset(npy_root=npy_root, num_slices=4, num_query=512)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False)
     model = build_sam_sdf(pretrained_path="medsam_vit_b.pth")
     model.to(device)
@@ -196,14 +164,13 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
     # ========== 新增：日志、最优模型、绘图容器 ==========
-    log_file = open("train_log.txt", "a", encoding="utf-8")
+    log_file = open("train_log_slice_cross_transformer.txt", "a", encoding="utf-8")
     best_loss = float("inf")
     epoch_list = []
     loss_list = []
     mae_list = []
 
     for epoch in range(epoch_num):
-        torch.cuda.empty_cache()
         total_loss = 0.0
         total_mae = 0.0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epoch_num}")
@@ -217,7 +184,6 @@ def main():
             box_input = batch["boxes"].to(device, non_blocking=True)
             del batch["boxes"]
 
-            torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
 
             slices_split = torch.split(slices, slice_batch_size, dim=0)
@@ -233,7 +199,6 @@ def main():
                     boxes_per_slice=box_input[start_idx:end_idx] if box_input is not None else None
                 )
                 pred_sdf_list.append(pred_sdf_sub)
-                torch.cuda.empty_cache()
             pred_sdf = torch.cat(pred_sdf_list, dim=0)
             loss = sdf_huber_loss(pred_sdf, sdf_gt)
             loss.backward()
@@ -249,7 +214,6 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
             del loss, pred_sdf, sdf_gt, loss_val
-            torch.cuda.empty_cache()
 
         # 单轮epoch统计
         avg_loss = total_loss / len(dataloader)
@@ -267,10 +231,11 @@ def main():
         # 保存最优模型
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save(model.state_dict(), "best_sdf_sam.pth")
+            torch.save(model.state_dict(), "best_sdf_sam_slice_cross_transformer_sin.pth")
             print(f"已更新最优模型，最优损失: {best_loss:.6f}")
         # 保存每轮模型
-        torch.save(model.state_dict(), f"./save_path/sdf_sam_epoch{epoch + 1}.pth")
+        if epoch % 10 == 0:
+            torch.save(model.state_dict(), f"./save_path/slice_cross_transformer_sin/sdf_sam_epoch{epoch + 1}.pth")
 
     # 训练结束，绘制曲线
     import matplotlib.pyplot as plt
@@ -293,7 +258,7 @@ def main():
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("train_curve.png")
+    plt.savefig("train_curve_slice_cross_transformer.png")
     plt.show()
 
     log_file.close()
