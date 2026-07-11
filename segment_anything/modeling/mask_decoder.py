@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 import torch.nn.functional as F
 from .prompt_encoder import PositionEmbedding3D
 # ====================== 核心：直接导入官方原生Transformer ======================
@@ -8,12 +9,7 @@ from .transformer import TwoWayTransformer
 MaskDecoder = None
 
 
-class SliceFeatureFusion(nn.Module):
-    """
-    【正统官方编码】
-    不复刻、不造轮子
-    直接调用 SAM/MedSAM 原生 TwoWayTransformer 完成切片-Prompt交叉编码
-    """
+class SliceEncoder(nn.Module):
     def __init__(self, embed_dim=256):
         super().__init__()
         # 完全使用官方原版Transformer解码器
@@ -45,6 +41,8 @@ class SliceFeatureFusion(nn.Module):
 
         # 还原多切片维度
         out_feat = out_feat.unflatten(0, (B, N_slices))
+
+
         return out_feat
 
 
@@ -70,6 +68,9 @@ class FeatureFusion(nn.Module):
         # 此刻两个张量完全同维度：
         # slice_fused_feat：[1,512,512]
         # pos3d_feat：       [1,512,512]
+        # 统一维度：5维 -> 3维，不改动任何主干网络
+        if slice_fused_feat.dim() == 5:
+            slice_fused_feat = slice_fused_feat.squeeze(-1).squeeze(-1)
         concat_feat = torch.cat([slice_fused_feat, pos3d_feat], dim=-1)
         print("concat_feat shape:", concat_feat .shape)
         # 完美匹配Conv2d卷积通道、权重、尺寸，零报错、零逻辑篡改
@@ -78,57 +79,133 @@ class FeatureFusion(nn.Module):
         # fused_feat = self.conv2(fused_feat)
         return concat_feat
 
-class SDFPredictor(nn.Module):
-    def __init__(self, embed_dim=512):
+class SineLayer(nn.Module):
+    def __init__(self, in_features, out_features, is_first=False, omega_0=30):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, 1),
+        self.omega_0 = omega_0
+        self.is_first = is_first
+        self.norm = nn.LayerNorm(in_features)
+        self.linear = nn.Linear(in_features, out_features)
 
+        self.init_weights()
+
+    def init_weights(self):
+        with torch.no_grad():
+            if self.is_first:
+                self.linear.weight.uniform_(
+                    -1 / self.linear.in_features,
+                     1 / self.linear.in_features
+                )
+            else:
+                bound = math.sqrt(6 / self.linear.in_features) / self.omega_0
+                self.linear.weight.uniform_(-bound, bound)
+
+    def forward(self, x):
+        x = self.norm(x)
+        return torch.sin(self.omega_0 * self.linear(x))
+
+
+class SDFPredictor(nn.Module):
+    def __init__(self, embed_dim=256, hidden_dim=256, omega_0=10):
+        super().__init__()
+        self.net = nn.Sequential(
+            SineLayer(embed_dim, hidden_dim, is_first=True, omega_0=omega_0),
+            SineLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
+            SineLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0),
+            nn.Linear(hidden_dim, 1)  # 最后一层必须线性
         )
 
     def forward(self, fused_feat):
-        return self.mlp(fused_feat).squeeze(-1)
+        return self.net(fused_feat).squeeze(-1)
 
 
 class SDFDecoder(nn.Module):
-    def __init__(self, embed_dim=256):
+    def __init__(self, embed_dim=256, two_way_transformer=None):
         super().__init__()
-        self.slice_encoder = SliceFeatureFusion(embed_dim)
-        self.pos3d_encoder = PositionEmbedding3D(embed_dim)
-        self.feat_fusion = FeatureFusion(embed_dim)
-        self.sdf_predictor = SDFPredictor(embed_dim)
 
-    def forward(
-        self,
-        slice_embeddings,
-        slice_pe,
-        sparse_prompt_embeds,
-        query_points,
-        slice_z_positions,
-        img_size
-    ):
-        B, N_slices = slice_embeddings.shape[:2]
-        N_query = query_points.shape[1]
+        self.slice_encoder = SliceEncoder(embed_dim)
 
-        # 1. 调用【官方原生Transformer】完成所有切片编码
-        # 完全原版、完全匹配预训练、无任何复刻误差
-        slice_local_feat = self.slice_encoder(slice_embeddings, slice_pe, sparse_prompt_embeds)
+        self.cross_slice = CrossSliceTransformer(embed_dim, 2, 8)
 
-        # 2. 多切片局部特征 -> 全局特征聚合（自研增量创新）
-        global_slice_feat = slice_local_feat.mean(dim=1, keepdim=True)
-        # mask_decoder.py 中 forward 函数内，repeat 行之前
-        print("global_slice_feat shape:", global_slice_feat.shape)  # 打印维度
-        global_slice_feat = global_slice_feat.repeat(1, N_query, 1, 1)
+        self.query_attn = QueryVolumeAttention(embed_dim)
 
-        # 3. 3D位置编码 & 跨维度融合
-        pos3d_feat = self.pos3d_encoder(query_points, img_size)
-        total_fused = self.feat_fusion(global_slice_feat, pos3d_feat)
+        self.pos3d = PositionEmbedding3D(embed_dim)
 
-        # 4. SDF回归
-        sdf_pred = self.sdf_predictor(total_fused)
+        self.mlp = SDFPredictor(embed_dim)
+
+    def forward(self, slice_embeddings, slice_pe, prompt, query_points, slice_z_positions,img_size):
+
+        # 1. slice encoding
+        slice_feat = self.slice_encoder(slice_embeddings, slice_pe, prompt)
+
+        # 2. cross-slice modeling
+        volume_feat = self.cross_slice(slice_feat)
+
+        # 3. query encoding
+        query_feat = self.pos3d(query_points, img_size)
+
+        # 4. query ↔ volume attention
+        query_feat = self.query_attn(query_feat, volume_feat)
+
+        # 5. sdf
+        sdf_pred = self.mlp(query_feat)
+
+        # print(
+        #     "SDFPredictor:",
+        #     sdf_pred.min().item(),
+        #     sdf_pred.max().item(),
+        #     sdf_pred.mean().item()
+        # )
 
         return sdf_pred
+
+
+class CrossSliceTransformer(nn.Module):
+    def __init__(self, dim, depth=2, heads=8):
+        super().__init__()
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=heads,
+            dim_feedforward=dim * 4,
+            batch_first=True,
+            norm_first=True
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=depth
+        )
+
+        self.pos_emb = nn.Embedding(512, dim)
+
+    def forward(self, x):
+        # x: (B,N,T,C)
+
+        B, N, T, C = x.shape
+
+        x = x.reshape(B, N * T, C)
+
+        x = self.transformer(x)
+
+        x = x.reshape(B, N, T, C)
+
+        return x
+
+class QueryVolumeAttention(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, 8, batch_first=True)
+
+    def forward(self, query, volume):
+        if volume.dim() == 4:
+            B, N, T, C = volume.shape
+            volume = volume.reshape(B, N*T, C)
+
+        out, _ = self.attn(
+            query=query,
+            key=volume,
+            value=volume
+        )
+
+        return out
