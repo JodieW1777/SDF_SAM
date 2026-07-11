@@ -83,11 +83,13 @@ class Sam(nn.Module):
 
         # 2. 获取切片位置编码
         slice_pe = self.prompt_encoder.get_dense_pe().unsqueeze(1).repeat(B, N_slices, 1, 1, 1)
-        print("points coords shape:", points_per_slice[0].shape)
-        print("points labels shape:", points_per_slice[1].shape)
+        # print("points coords shape:", points_per_slice[0].shape)
+        # print("points labels shape:", points_per_slice[1].shape)
         # 3. 逐切片编码prompt特征
         sparse_prompt_embeds = []
         for i in range(N_slices):
+            # print(points_per_slice[0].shape)
+            # print(points_per_slice[1].shape)
             points = (points_per_slice[0][:, i], points_per_slice[1][:, i]) if points_per_slice else None
             boxes = boxes_per_slice[:, i] if boxes_per_slice is not None else None
             sparse_emb, _ = self.prompt_encoder(points=points, boxes=boxes, masks=None)
