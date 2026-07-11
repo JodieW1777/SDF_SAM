@@ -16,12 +16,12 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 IMG_SIZE = 1024
 NUM_SLICES = 4  # 改为4张切片输入
 SLICE_BATCH_SIZE = 4  # 批次大小等于总切片，一次推理完成
-NUM_QUERY = 3000  # 每张切片的查询点数量
+NUM_QUERY = 50000 # 每张切片的查询点数量
 # 路径配置
-MODEL_WEIGHT = "best_sdf_sam.pth"
-NII_PATH = "data_test/FLARE22_Tr_0002_0000.nii.gz"
+MODEL_WEIGHT = "save_path/slice_cross_transformer_sin/sdf_sam_epoch17.pth"
+NII_PATH = "data/FLARE22Train/images/FLARE22_Tr_0002_0000.nii.gz"
 # 从3D Slicer导出的像素框 [x0, y0, z0, x1, y1, z1]
-GLOBAL_BOX = [70, 109, 21, 215, 218, 72]
+GLOBAL_BOX = [70, 109, 21, 218, 215, 75]
 
 
 # ===================== 工具函数 =====================
@@ -142,25 +142,19 @@ def build_batch_input(img_vol, sample_ids, bbox, ori_H, ori_W):
         torch.stack(empty_lab_list, dim=0).to(DEVICE)
     )
 
-    # 全局查询点：仅在框范围内生成（核心修改，修复randint边界问题）
-    D_total = img_vol.shape[0]
     query_pts = []
-    # 确保采样数量不超过有效坐标总数，避免无限循环
-    max_possible_pts = (x_max - x_min) * (y_max - y_min) * len(sample_ids)
-    safe_num_query = min(NUM_QUERY, max_possible_pts) if max_possible_pts > 0 else 100
-
-    for _ in range(safe_num_query):
-        # 修复：randint的high是开区间，所以x取到x_max（原x1），y取到y_max（原y1）
-        x = np.random.randint(x_min, x_max)  # [x_min, x_max) 确保x_min < x_max
-        y = np.random.randint(y_min, y_max)  # [y_min, y_max) 确保y_min < y_max
-        # z: 仅在有效切片范围内采样（进一步缩小范围）
-        z = np.random.choice(sample_ids) if len(sample_ids) > 0 else np.random.randint(0, D_total)
+    for _ in range(NUM_QUERY):
+        x = np.random.uniform(x_min, x_max)
+        y = np.random.uniform(y_min, y_max)
+        z = np.random.uniform(z_min, z_max)
         query_pts.append([x, y, z])
+    query_pts = np.array(query_pts, dtype=np.float32)
 
-    # 兜底：如果采样点为空，生成默认点
-    if not query_pts:
-        query_pts = [[(x_min + x_max) // 2, (y_min + y_max) // 2, sample_ids[0]] if len(sample_ids) > 0 else 0]
-
+    # 兜底：如果采样点为空，生成框中心单点
+    if len(query_pts) == 0:
+        query_pts = np.array([
+            [(x_min + x_max) // 2, (y_min + y_max) // 2, (z_min + z_max) // 2]
+        ], dtype=np.float32)
     query_tensor = torch.tensor(query_pts).float().to(DEVICE)
     raw_query_np = np.array(query_pts)
     return slices_tensor, z_tensor, bbox_tensor, pts_tensor, query_tensor, raw_query_np
@@ -169,98 +163,153 @@ def build_batch_input(img_vol, sample_ids, bbox, ori_H, ori_W):
 # ===================== 3. 批量推理（4张一次性输入） =====================
 @torch.no_grad()
 def batch_sdf_inference(model, slices_tensor, z_tensor, bbox_tensor, pts_tensor, query_tensor):
+    """
+    适配 SDF-SAM 原始模型版本的稳定推理脚本
+    """
+
+    model.eval()
     pred_list = []
-    # 不再拆分query，全程共用一套全局查询点
+
+    B, S = slices_tensor.shape[0], slices_tensor.shape[0]  # 4 slices
+
+    # ==============================
+    # 1. 保证输入维度安全
+    # ==============================
+    # slices: [S, 3, H, W]
+    # z_tensor: [S]
+    # bbox_tensor: [S, 4]
+    # pts_tensor: (points, labels)
+
+    points, labels = pts_tensor  # points:[S,1,2] labels:[S,1]
+
+    # ==============================
+    # 2. 扩展为 SAM 期望格式
+    # ==============================
+    # SAM期望: [B, N, 2]
+    points = points.unsqueeze(0)   # [1, S, 1, 2]
+    labels = labels.unsqueeze(0)   # [1, S, 1]
+
+    bbox_tensor = bbox_tensor.unsqueeze(0)  # [1, S, 4]
+    z_tensor = z_tensor.unsqueeze(0)        # [1, S]
+
+    # query保持不变: [N, 3]
+    query_tensor = query_tensor
+
+    # ==============================
+    # 3. forward batch inference
+    # ==============================
     for idx, sub_slice in enumerate(torch.split(slices_tensor, SLICE_BATCH_SIZE, dim=0)):
-        z_sub = torch.split(z_tensor, SLICE_BATCH_SIZE, dim=0)[idx]
-        box_sub = torch.split(bbox_tensor, SLICE_BATCH_SIZE, dim=0)[idx]
-        p0_sub = torch.split(pts_tensor[0], SLICE_BATCH_SIZE, dim=0)[idx]
-        p1_sub = torch.split(pts_tensor[1], SLICE_BATCH_SIZE, dim=0)[idx]
-        # query_tensor全程不变，统一传入
+
+        z_sub = z_tensor[:, idx:idx+len(sub_slice)]           # [1, S_sub]
+        box_sub = bbox_tensor[:, idx:idx+len(sub_slice)]      # [1, S_sub, 4]
+
+        # ⭐关键修复：不要破坏 [B,S,N,2]
+        p_sub = points[:, idx:idx+len(sub_slice), :, :]       # [1, S_sub, 1, 2]
+        l_sub = labels[:, idx:idx+len(sub_slice), :]          # [1, S_sub, 1]
+
+        print("coords:", p_sub.shape)
+        print("labels:", l_sub.shape)
+        query_tensor = query_tensor.unsqueeze(0)
         sdf_sub = model(
             slices=sub_slice,
             query_points=query_tensor,
-            slice_z_positions=z_sub,
-            points_per_slice=(p0_sub, p1_sub),
-            boxes_per_slice=box_sub
+            slice_z_positions=z_sub.squeeze(0),
+            points_per_slice=(p_sub, l_sub),
+            boxes_per_slice=box_sub.squeeze(0)
         )
+
         pred_list.append(sdf_sub)
-    all_sdf = torch.cat(pred_list, dim=0)
-    return all_sdf.cpu()
 
-
+    return torch.cat(pred_list, dim=0)
 # ===================== 4. SDF重建网格 =====================
 def full_sdf_to_mesh(img_vol, slice_sdf_vals, query_coords, level=0.0):
+    x0, y0, z0, x1, y1, z1 = GLOBAL_BOX
+    x_min, x_max = min(x0, x1), max(x0, x1)
+    y_min, y_max = min(y0, y1), max(y0, y1)
+    z_min, z_max = min(z0, z1), max(z0, z1)
     D, H, W = img_vol.shape
-    z_grid, y_grid, x_grid = np.meshgrid(np.arange(D), np.arange(H), np.arange(W), indexing="ij")
-    full_sdf = np.zeros((D, H, W), dtype=np.float32)
-
-    sdf_data = slice_sdf_vals[0]
-    pts_data = query_coords
+    if torch.is_tensor(slice_sdf_vals):
+        sdf_data = slice_sdf_vals[0].detach().cpu().numpy()
+    else:
+        sdf_data = slice_sdf_vals[0]
+    pts_data = np.asarray(query_coords)
     print("坐标点数量：", len(pts_data))
     print("SDF数值数量：", len(sdf_data))
+    print(f"原始归一SDF min={sdf_data.min():.4f}, max={sdf_data.max():.4f}")
 
-    # 修复插值：cubic + 减小填充值
-    full_sdf = griddata(
-        points=pts_data,
-        values=sdf_data,
-        xi=(z_grid, y_grid, x_grid),
-        method="linear",
-        fill_value=2.0
-    )
-    full_sdf = np.nan_to_num(full_sdf, nan=2.0)
+    # 1、初始化全场：框外填充超大正数，截断立方体方块
+    full_sdf = np.full((D, H, W), fill_value=10.0, dtype=np.float32)
+    valid_mask = np.zeros((D, H, W), dtype=bool)
+    for i, p in enumerate(pts_data):
+        z, y, x = p.astype(int)
+        if 0 <= z < D and 0 <= y < H and 0 <= x < W:
+            full_sdf[z, y, x] = sdf_data[i]
+            valid_mask[z, y, x] = True
 
-    s_min = full_sdf.min()
-    s_max = full_sdf.max()
-    print(f"完整SDF场范围 min={s_min:.2f}, max={s_max:.2f}")
+    # 2、仅在框内部插值，框外保持10，彻底消除外围方块等值面
+    valid_pts = np.argwhere(valid_mask)
+    valid_vals = full_sdf[valid_mask]
+    zz, yy, xx = np.meshgrid(np.arange(D), np.arange(H), np.arange(W), indexing="ij")
+    grid_pts = np.stack([zz, yy, xx], axis=-1).reshape(-1, 3)
+    full_sdf = griddata(valid_pts, valid_vals, grid_pts, method="linear", fill_value=10.0)
+    full_sdf = full_sdf.reshape(D, H, W)
+
+    # 3、值域矫正：均值归零 + 适度拉伸，放大器官内外差值（解决窄值域全是0附近）
+    valid_area = full_sdf[full_sdf < 9.0]  # 只处理框内有效区域
+    mean_valid = np.mean(valid_area)
+    full_sdf = full_sdf - mean_valid
+    stretch_scale = 10.0  # 拉伸放大正负差异，可微调
+    full_sdf[full_sdf < 9.0] *= stretch_scale
+
+    s_min = full_sdf[full_sdf < 9.0].min()
+    s_max = full_sdf[full_sdf < 9.0].max()
+    print(f"拉伸矫正后框内SDF min={s_min:.3f}, max={s_max:.3f}")
+
     real_level = 0.0
-
-    # 第一层兜底：区间完全不包含0，直接调整阈值
     if not (s_min < 0 < s_max):
-        print("警告：全场不含0，自动取中点阈值")
-        real_level = (s_min + s_max) / 2
+        real_level = np.percentile(full_sdf[full_sdf < 9.0], 48)
 
-    # 第二层兜底：调整后依然全场同侧，直接返回空
-    if s_min >= real_level:
-        print("【致命】全场SDF均大于等值面，无器官表面")
-        empty_mesh = trimesh.Trimesh()
-        return empty_mesh, full_sdf
-    if s_max <= real_level:
-        print("【致命】全场SDF均小于等值面，无外表面")
-        empty_mesh = trimesh.Trimesh()
-        return empty_mesh, full_sdf
+    # 统计有效等值（只统计框内）
+    cross_mask = ((full_sdf < real_level) & (np.roll(full_sdf, 1, axis=0) > real_level)) \
+               | ((full_sdf > real_level) & (np.roll(full_sdf, 1, axis=0) < real_level)) \
+               | ((full_sdf < real_level) & (np.roll(full_sdf, 1, axis=1) > real_level)) \
+               | ((full_sdf > real_level) & (np.roll(full_sdf, 1, axis=1) < real_level)) \
+               | ((full_sdf < real_level) & (np.roll(full_sdf, 2, axis=2) > real_level)) \
+               | ((full_sdf > real_level) & (np.roll(full_sdf, 2, axis=2) < real_level))
+    cross_count = np.sum(cross_mask & (full_sdf < 9.0))
 
-    # 打印诊断信息
     print("====SDF诊断信息====")
-    print(f"SDF全场最小值 s_min={s_min:.3f}")
-    print(f"SDF全场最大值 s_max={s_max:.3f}")
-    print(f"当前等值面 real_level={real_level:.3f}")
-    cross_mask = (full_sdf < real_level) & (np.roll(full_sdf, 1, axis=0) > real_level) \
-              | (full_sdf > real_level) & (np.roll(full_sdf, 1, axis=0) < real_level) \
-              | (full_sdf < real_level) & (np.roll(full_sdf, 1, axis=1) > real_level) \
-              | (full_sdf > real_level) & (np.roll(full_sdf, 1, axis=1) < real_level) \
-              | (full_sdf < real_level) & (np.roll(full_sdf, 1, axis=2) > real_level) \
-              | (full_sdf > real_level) & (np.roll(full_sdf, 1, axis=2) < real_level)
-    cross_count = np.sum(cross_mask)
-    print(f"穿过等值面的体素数量：{cross_count}")
+    print(f"框内最小值 s_min={s_min:.3f}")
+    print(f"框内最大值 s_max={s_max:.3f}")
+    print(f"提取等值面 level={real_level:.3f}")
+    print(f"器官有效交叉体素：{cross_count}")
     print("===================")
 
+    # 提取网格
     try:
         verts, faces, _, _ = marching_cubes(full_sdf, level=real_level)
     except ValueError:
-        print("等值面不存在，重新调整阈值")
-        real_level = (s_min + s_max) / 2
+        real_level = np.percentile(full_sdf[full_sdf < 9.0], 50)
         verts, faces, _, _ = marching_cubes(full_sdf, level=real_level)
 
     mesh = trimesh.Trimesh(vertices=verts, faces=faces)
-    #mesh.smooth()
-    return mesh, full_sdf
+    # 过滤远离包围盒的面片，剔除外围大方块
+    vx, vy, vz = verts.T
+    box_filter = (vx >= x_min) & (vx <= x_max) & (vy >= y_min) & (vy <= y_max) & (vz >= z_min) & (vz <= z_max)
+    keep_vert_idx = np.nonzero(box_filter)[0]
+    # mesh = mesh.submesh([keep_vert_idx], append=True)[0]
 
+    # 网格清理去碎面
+    # mesh.remove_degenerate_faces()
+    # mesh.remove_duplicate_faces()
+    mesh.remove_unreferenced_vertices()
+    mesh.fill_holes()
+    return mesh, full_sdf
 
 # ===================== 主流程 =====================
 if __name__ == "__main__":
     print("加载 SDF-SAM 模型...")
-    model = build_sam_sdf(pretrained_path="medsam_vit_b.pth")
+    model = build_sam_sdf(pretrained_path="save_path/slice_cross_transformer_sin/sdf_sam_epoch17.pth")
     model.load_state_dict(torch.load(MODEL_WEIGHT, map_location=DEVICE))
     model.to(DEVICE)
     model.eval()
