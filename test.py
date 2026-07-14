@@ -14,11 +14,11 @@ from scipy.interpolate import griddata
 # ===================== 全局超参（修改切片数量为4） =====================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 IMG_SIZE = 1024
-NUM_SLICES = 4  # 改为4张切片输入
-SLICE_BATCH_SIZE = 4  # 批次大小等于总切片，一次推理完成
+NUM_SLICES = 8  # 改为4张切片输入
+SLICE_BATCH_SIZE = 8  # 批次大小等于总切片，一次推理完成
 NUM_QUERY = 50000 # 每张切片的查询点数量
 # 路径配置
-MODEL_WEIGHT = "save_path/slice_cross_transformer_sin/sdf_sam_epoch17.pth"
+MODEL_WEIGHT = "best_sdf_sam_slice_cross_transformer_sin.pth"
 NII_PATH = "data/FLARE22Train/images/FLARE22_Tr_0002_0000.nii.gz"
 # # 从3D Slicer导出的像素框 [x0, y0, z0, x1, y1, z1]
 # GLOBAL_BOX = [70, 109, 21, 218, 215, 75]
@@ -249,7 +249,7 @@ def batch_sdf_inference(model, slices_tensor, z_tensor, bbox_tensor, pts_tensor,
             query_points=query_tensor,
             slice_z_positions=z_sub.squeeze(0),
             points_per_slice=(p_sub, l_sub),
-            boxes_per_slice=box_sub.squeeze(0)
+            boxes_per_slice=box_sub
         )
 
         pred_list.append(sdf_sub)
@@ -425,7 +425,7 @@ def full_sdf_to_mesh(img_vol, lab_vol, slice_sdf_vals, query_coords, bbox, sampl
 
 if __name__ == "__main__":
     print("加载 SDF-SAM 模型...")
-    model = build_sam_sdf(pretrained_path="save_path/slice_cross_transformer_sin/sdf_sam_epoch17.pth")
+    model = build_sam_sdf(pretrained_path="best_sdf_sam_slice_cross_transformer_sin.pth")
     model.load_state_dict(torch.load(MODEL_WEIGHT, map_location=DEVICE))
     model.to(DEVICE)
     model.eval()
