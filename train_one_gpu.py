@@ -29,7 +29,7 @@ def mask2sdf(mask):
 
 # ====================== 3. 自定义Nii数据集 ======================
 class NiiSDFDataset(Dataset):
-    def __init__(self, img_dir, label_dir, num_slices=4, num_query=512, img_size=1024):
+    def __init__(self, img_dir, label_dir, num_slices=8, num_query=1024, img_size=1024):
         self.img_dir = img_dir
         self.label_dir = label_dir
         self.num_slices = num_slices
@@ -38,24 +38,7 @@ class NiiSDFDataset(Dataset):
         self.img_files = sorted([f for f in os.listdir(img_dir) if f.endswith(".nii.gz")])
     def __len__(self):
         return len(self.img_files)
-    def _get_random_bbox(self, mask):
-        """根据单张切片mask生成随机扰动外接框（模拟人工框选）"""
-        ys, xs = np.where(mask > 0)
-        if len(ys) == 0 or len(xs) == 0:
-            return np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
-        xmin, xmax = xs.min(), xs.max()
-        ymin, ymax = ys.min(), ys.max()
-        h, w = mask.shape
-        scale = np.random.uniform(0.85, 1.15)
-        cx, cy = (xmin + xmax) / 2, (ymin + ymax) / 2
-        half_w = (xmax - xmin) / 2 * scale
-        half_h = (ymax - ymin) / 2 * scale
-        xmin = max(0, cx - half_w)
-        xmax = min(w - 1, cx + half_w)
-        ymin = max(0, cy - half_h)
-        ymax = min(h - 1, cy + half_h)
-        bbox = np.array([xmin / w, ymin / h, xmax / w, ymax / h], dtype=np.float32)
-        return bbox
+
     def _resize_to_1024(self, img_slice, mask_slice):
         """强制将任意尺寸切片resize到1024×1024"""
         h, w = img_slice.shape
@@ -208,12 +191,12 @@ def main():
     img_dir = "data/FLARE22Train/images"
     label_dir = "data/FLARE22Train/labels"
     batch_size = 1
-    slice_batch_size = 4
+    slice_batch_size = 8
     lr = 5e-5  # 下调学习率，多约束防止震荡
     epoch_num = 100
     dataset = NiiSDFDataset(img_dir, label_dir)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False)
-    model = build_sam_sdf(pretrained_path="save_path\slice_cross_transformer_sin\sdf_sam_epoch13.pth")
+    model = build_sam_sdf(pretrained_path="sdf_sam_epoch13.pth")
     model.to(device)
     model.train()
     torch.backends.cudnn.benchmark = False
