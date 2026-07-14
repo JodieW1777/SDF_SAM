@@ -256,7 +256,7 @@ def batch_sdf_inference(model, slices_tensor, z_tensor, bbox_tensor, pts_tensor,
 
     return torch.cat(pred_list, dim=0)
 # ===================== 4. SDF重建网格 =====================
-def full_sdf_to_mesh(img_vol, lab_vol, slice_sdf_vals, query_coords, bbox, sample_slice_ids, level=0.0):
+def full_sdf_to_mesh(img_vol, lab_vol, slice_sdf_vals, query_coords, bbox, sample_slice_ids, nii_affine, level=0.0):
     x0, y0, z0, x1, y1 ,z1= bbox
     x_min, x_max = min(x0, x1), max(x0, x1)
     y_min, y_max = min(y0, y1), max(y0, y1)
@@ -286,11 +286,7 @@ def full_sdf_to_mesh(img_vol, lab_vol, slice_sdf_vals, query_coords, bbox, sampl
         if 0 <= z < D and 0 <= y < H and 0 <= x < W:
             full_sdf[z, y, x] = sdf_data[i]
             valid_mask[z, y, x] = True
-    # 导出原始离散SDF NII（3D Slicer单独看体素值）
-    import nibabel
-    raw_sdf_nii = nib.Nifti1Image(full_sdf, np.eye(4))
-    nib.save(raw_sdf_nii, "./raw_sdf_volume.nii.gz")
-    print("【可视化】原始离散SDF体 raw_sdf_volume.nii.gz 已保存")
+
 
     # 2、线性插值补全框内连续SDF场
     valid_pts = np.argwhere(valid_mask)
@@ -300,16 +296,13 @@ def full_sdf_to_mesh(img_vol, lab_vol, slice_sdf_vals, query_coords, bbox, sampl
     full_sdf = griddata(valid_pts, valid_vals, grid_pts, method="linear", fill_value=10.0)
     full_sdf = full_sdf.reshape(D, H, W)
 
-    # 导出插值后稠密SDF NII
-    interp_sdf_nii = nib.Nifti1Image(full_sdf, np.eye(4))
-    nib.save(interp_sdf_nii, "./interpolated_sdf_volume.nii.gz")
-    print("【可视化】插值稠密SDF体 interpolated_sdf_volume.nii.gz 已保存")
+
 
     # 3、值域矫正：仅框内做均值归零+拉伸
     valid_area = full_sdf[full_sdf < 9.0]
     mean_valid = np.mean(valid_area)
     full_sdf = full_sdf - mean_valid
-    stretch_scale = 10.0
+    stretch_scale = 1.0
     full_sdf[full_sdf < 9.0] *= stretch_scale
 
     s_min = full_sdf[full_sdf < 9.0].min()
@@ -342,70 +335,94 @@ def full_sdf_to_mesh(img_vol, lab_vol, slice_sdf_vals, query_coords, bbox, sampl
     print(f"器官有效交叉体素：{cross_count}")
     print("===================")
 
+    # try:
+    #     verts_pred, faces_pred, _, _ = marching_cubes(full_sdf, level=real_level)
+    # except ValueError:
+    #     real_level = np.percentile(full_sdf[full_sdf < 9.0], 50)
+    #     verts_pred, faces_pred, _, _ = marching_cubes(full_sdf, level=real_level)
+    # mesh = trimesh.Trimesh(vertices=verts_pred, faces=faces_pred)
+    # mesh.export("./4slice_organ_mesh.obj")
+    # mesh.show()
     try:
-        verts_pred, faces_pred, _, _ = marching_cubes(full_sdf, level=real_level)
+        verts_pred_pix, faces_pred, _, _ = marching_cubes(full_sdf, level=real_level)
     except ValueError:
         real_level = np.percentile(full_sdf[full_sdf < 9.0], 50)
-        verts_pred, faces_pred, _, _ = marching_cubes(full_sdf, level=real_level)
-    pred_mesh = trimesh.Trimesh(vertices=verts_pred, faces=faces_pred)
-    # # 过滤框外碎片
-    # vx, vy, vz = verts_pred.T
-    # box_filter = (vx >= x_min) & (vx <= x_max) & (vy >= y_min) & (vy <= y_max) & (vz >= z_min) & (vz <= z_max)
-    # keep_vert_idx = np.nonzero(box_filter)[0]
-    # pred_mesh = pred_mesh.submesh([keep_vert_idx], append=True)[0]
-    # pred_mesh.remove_unreferenced_vertices()
-    # pred_mesh.fill_holes()
-    # 预测：灰色不透明
-    pred_mesh.visual.vertex_colors = np.full((len(pred_mesh.vertices), 4), [200, 200, 200, 255], dtype=np.uint8)
-
-    # ========== 2. 原始真值器官网格（绿色半透明，用于对比位置） ==========
+        verts_pred_pix, faces_pred, _, _ = marching_cubes(full_sdf, level=real_level)
+        # 真值像素网格
     mask_bin = (lab_vol > 0).astype(np.float32)
-    vert_gt, face_gt, _, _ = marching_cubes(mask_bin, level=0.5)
-    gt_mesh = trimesh.Trimesh(vertices=vert_gt, faces=face_gt)
-    # 真值：淡绿色半透明，方便重叠观察偏移
-    gt_mesh.visual.vertex_colors = np.full((len(gt_mesh.vertices), 4), [30, 220, 80, 110], dtype=np.uint8)
-    # 导出真值label NII，Slicer逐层对比
-    label_nii = nib.Nifti1Image(lab_vol, np.eye(4))
-    nib.save(label_nii, "./gt_organ_label.nii.gz")
-    print("【对比真值】原始器官掩码 gt_organ_label.nii.gz 已保存")
+    mask_bin = (lab_vol > 0).astype(np.float32)
+    vert_gt_pix, face_gt, _, _ = marching_cubes(mask_bin, level=0.1)
 
-    # ========== 3. SDF采样彩色小球 ==========
-    point_radius = 0.8
-    point_meshes = []
-    import csv
-    with open("./sdf_point_value.csv", "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["X", "Y", "Z", "raw_sdf_value"])
-        for coord, val in zip(pts_data, sdf_data):
-            writer.writerow([coord[0], coord[1], round(val, 6)])
-    print("【数值提示】sdf_point_value.csv 坐标+SDF对照表")
+    def pix2world(pix_verts, affine):
+        """
+        pix_verts: N,3 [z, y, x] marching_cubes 体素角点整数坐标
+        affine: nibabel 4×4 LPS仿射矩阵
+        return N,3 RAS世界坐标（适配3D Slicer，修正体素中心偏移）
+        """
+        z_corner = pix_verts[:, 0]
+        y_corner = pix_verts[:, 1]
+        x_corner = pix_verts[:, 2]
 
-    for coord, val in zip(pts_data, sdf_data):
-        sphere = trimesh.creation.icosphere(radius=point_radius, subdivisions=1)
-        if val < 0:
-            sphere.visual.vertex_colors = np.full((len(sphere.vertices), 4), [30, 80, 255, 255], dtype=np.uint8)
+        # 关键修复：marching_cubes输出是体素角，NIfTI坐标基于体素中心，+0.5偏移
+        x_center = x_corner + 0.5
+        y_center = y_corner + 0.5
+        z_center = z_corner + 0.5
+
+        # 构造齐次 IJK [X,Y,Z,1]
+        N = len(x_center)
+        pts_ijk = np.stack([x_center, y_center, z_center, np.ones(N)], axis=0)  # (4, N)
+
+        # IJK像素中心 → LPS物理坐标
+        lps_world = affine @ pts_ijk
+        l_x, l_y, l_z = lps_world[:3]
+
+        # LPS -> RAS标准转换：R=-L, A=-P, S=Z（自适应Z轴正负）
+        ras_x = -l_x
+        ras_y = -l_y
+        # 判断Z轴方向，负数则翻转
+        if affine[2, 2] < 0:
+            ras_z = -l_z
         else:
-            sphere.visual.vertex_colors = np.full((len(sphere.vertices), 4), [255, 40, 40, 255], dtype=np.uint8)
-        sphere.apply_translation(coord)
-        point_meshes.append(sphere)
+            ras_z = l_z
 
-    # ========== 4. 合并三者到同一个对比场景 ==========
+        return np.stack([ras_x, ras_y, ras_z], axis=1)
+
+    verts_pred_world = pix2world(verts_pred_pix, nii_affine)
+    vert_gt_world = pix2world(vert_gt_pix, nii_affine)
+
+    # 预测网格（世界坐标，灰色）
+    pred_mesh = trimesh.Trimesh(vertices=verts_pred_world, faces=faces_pred)
+
+    pred_mesh.export("./pred_organ_world.obj")
+    print("【Slicer专用】预测器官世界坐标网格 pred_organ_world.obj")
+
+    # 真值网格（世界坐标，绿色半透明）
+    gt_mesh = trimesh.Trimesh(vertices=vert_gt_world, faces=face_gt)
+    gt_mesh.visual.vertex_colors = np.full((len(gt_mesh.vertices), 3), [30, 220, 80], dtype=np.uint8)
+    gt_mesh.export("./gt_organ_world.obj")
+    gt_mesh.show()
+    print("【Slicer专用】真值器官世界坐标网格 gt_organ_world.obj")
+
+    # 导出真值label NII（同原始CT仿射）
+    label_nii = nib.Nifti1Image(lab_vol, nii_affine)
+    nib.save(label_nii, "./gt_organ_label.nii.gz")
+    print("【对比真值】gt_organ_label.nii.gz 已保存")
+
+    # ========= 合并对比场景（像素坐标，本地查看用） =========
     scene = trimesh.Scene()
-    # 添加真值器官（绿色半透明）
     scene.add_geometry(gt_mesh, "gt_organ_green")
-    # 添加预测重建器官（灰色）
     scene.add_geometry(pred_mesh, "pred_organ_gray")
-    # # 添加所有SDF采样点
-    # for idx, p_mesh in enumerate(point_meshes):
-    #     scene.add_geometry(p_mesh, f"sdf_point_{idx}")
-
-    # 输出统一对比OBJ，打开直接重叠看位置是否匹配
     scene.export("./compare_pred_gt.obj")
-    print("【对比文件】compare_pred_gt.obj 已生成：绿色=真实器官，灰色=重建器官，红蓝=SDF采样点")
+    print("【本地查看】对比网格 compare_pred_gt.obj")
 
     return pred_mesh, full_sdf
 
+
+
+
+
 # ===================== 主流程 =====================
+
 if __name__ == "__main__":
     print("加载 SDF-SAM 模型...")
     model = build_sam_sdf(pretrained_path="save_path/slice_cross_transformer_sin/sdf_sam_epoch17.pth")
@@ -417,6 +434,7 @@ if __name__ == "__main__":
     print("加载3D医学体数据...")
     nii_img = nib.load(NII_PATH)
     img_data = nii_img.get_fdata()
+    nii_affine = nii_img.affine  # 关键：空间转换矩阵，用于网格对齐
     img_vol = img_data.transpose((2, 0, 1))  # (D, H, W)
     D, H, W = img_vol.shape
     print(f"3D体尺寸: D={D}, H={H}, W={W}")
@@ -424,7 +442,7 @@ if __name__ == "__main__":
     label_nii = nib.load(LABEL_PATH)
     lab_data = label_nii.get_fdata()
     lab_vol = lab_data.transpose((2, 0, 1))
-
+    print("Affine Z缩放系数：", nii_affine[2, 2])
     GLOBAL_BOX = get_auto_global_box(lab_vol, padding=10)
     print("自动基于真值生成Global Box：", GLOBAL_BOX)
     # x0, y0, z0, x1, y1, z1 = GLOBAL_BOX
@@ -456,11 +474,12 @@ if __name__ == "__main__":
         sdf_vals,
         raw_query_np,
         GLOBAL_BOX,
-        sample_slice_ids
+        sample_slice_ids,
+        nii_affine
     )
 
     # 保存&可视化
-    mesh.export("./4slice_organ_mesh.obj")
-    print("生成网格已保存到 4slice_organ_mesh.obj")
+    # mesh.export("./4slice_organ_mesh.obj")
+    # print("生成网格已保存到 4slice_organ_mesh.obj")
     print(f"顶点={len(mesh.vertices)}, 面片={len(mesh.faces)}")
     mesh.show()
