@@ -249,6 +249,7 @@ class PositionEmbeddingRandom(nn.Module):#如点、框、掩码的位置）生�
 class PositionEmbedding3D(nn.Module):# 给任意3D点P=(x,y,z)生成位置编码F_3d(P)
     def __init__(self, embed_dim: int = 128, max_z: float = 100.0):
         super().__init__()
+        self.max_z = float(max_z)
         # 复用原SAM的2D位置编码层（PositionEmbeddingRandom）处理x,y
         self.pe_2d = PositionEmbeddingRandom(embed_dim)
         # 新增z轴的位置编码（用MLP处理z坐标）
@@ -273,7 +274,10 @@ class PositionEmbedding3D(nn.Module):# 给任意3D点P=(x,y,z)生成位置编码
         # 用原SAM的forward_with_coords生成2D位置编码
         pe_2d = self.pe_2d.forward_with_coords(xy, img_size)  # [B, N, embed_dim*2]
         # 2. 处理z（切片方向坐标）
-        z = points_3d[..., 2:]  # [B, N, 1]
+        # Normalize depth just like x/y. Raw slice indices vary greatly across
+        # scans and otherwise make the learned z embedding case-dependent.
+        depth = max(float(img_size[2]) if len(img_size) > 2 else self.max_z, 1.0)
+        z = points_3d[..., 2:] / max(depth - 1.0, 1.0)
         pe_z = self.z_mlp(z)  # [B, N, embed_dim*2]
         # 3. 拼接并映射到目标维度
         pe_combined = torch.cat([pe_2d, pe_z], dim=-1)  # [B, N, embed_dim*4]
