@@ -45,68 +45,134 @@ class Sam(nn.Module):
     # 完全重写forward前向传播（核心改造）
     def forward(
             self,
-            slices: torch.Tensor,
-            query_points: torch.Tensor,
-            slice_z_positions: torch.Tensor,
-            points_per_slice: Tuple[torch.Tensor, torch.Tensor],
-            boxes_per_slice: torch.Tensor,
+            xy_slices, xz_slices, yz_slices,
+            xy_rel, xz_rel, yz_rel,
+            xy_boxes, xz_boxes, yz_boxes,
+            query_points,
+            points_per_slice,
+            eikonal_mode=False,
     ) -> torch.Tensor:
-        # =====================新增兼容4维多切片逻辑【核心修改1】=====================
-        # 判断输入是4维：[N_slices, 3, H, W] 代表 1个病人、多张切片，无Batch维度
-        if slices.dim() == 4:
-            N_slices = slices.shape[0]
-            B = 1
-            # 在第0维新增Batch维度，4维→5维 [1, N_slices, 3, H, W]
-            slices = slices.unsqueeze(0)
-        else:
-            # 原生训练5维输入 [B, N_slices, 3, H, W]，正常解包
-            B, N_slices = slices.shape[:2]
-        # =========================================================================
-        # 【自动计算图像尺寸，不再写死1024！！】
-        # slices shape: [B, N_slices, 3, H, W]
-        H, W = slices.shape[-2], slices.shape[-1]
-        img_size = (H, W)
-        # 1. 批量编码所有切片图像特征
-        # 分片处理切片，避免单次超大张量输入编码器
-        slices_reshaped = slices.reshape(-1, 3, slices.shape[-2], slices.shape[-1])
-        slices_reshaped_split = torch.split(slices_reshaped, 8, dim=0)
-        slices_processed_list = []
-        for sub_tensor in slices_reshaped_split:
-            sub_processed = self.image_encoder(sub_tensor)
-            slices_processed_list.append(sub_processed)
-            del sub_tensor
-            torch.cuda.empty_cache()
-        slices_processed = torch.cat(slices_processed_list, dim=0)
-        slice_embeddings = slices_processed.reshape(B, N_slices, -1, slices_processed.shape[-2],slices_processed.shape[-1])
-        # # Cross-Slice Transformer
-        # slice_embeddings = self.slice_fusion(slice_embeddings)
+    # 处理每组切片维度兼容：4维单病例自动加batch维
+        def encode_plane(plane_img):
+            if plane_img.dim() == 4:
+                B = 1
+                plane_img = plane_img.unsqueeze(0)
+            else:
+                B = plane_img.shape[0]
+            B, N, C, H, W = plane_img.shape
+            # PatchEmbed uses non-overlapping 16x16 patches. Pad only the
+            # bottom/right edge so every native pixel is represented; unlike
+            # resize this does not move or interpolate any image content.
+            patch_h, patch_w = self.image_encoder.patch_embed.proj.kernel_size
+            pad_h = (-H) % patch_h
+            pad_w = (-W) % patch_w
+            flat = plane_img.reshape(-1, 3, H, W)
+            if pad_h or pad_w:
+                flat = F.pad(flat, (0, pad_w, 0, pad_h))
+            feat = self.image_encoder(flat)
+            return feat.unflatten(0, (B, N)), (H + pad_h, W + pad_w)
 
-        # 2. 获取切片位置编码
-        slice_pe = self.prompt_encoder.get_dense_pe().unsqueeze(1).repeat(B, N_slices, 1, 1, 1)
-        # print("points coords shape:", points_per_slice[0].shape)
-        # print("points labels shape:", points_per_slice[1].shape)
-        # 3. 逐切片编码prompt特征
-        sparse_prompt_embeds = []
-        for i in range(N_slices):
-            # print(points_per_slice[0].shape)
-            # print(points_per_slice[1].shape)
-            points = (points_per_slice[0][:, i], points_per_slice[1][:, i]) if points_per_slice else None
-            boxes = boxes_per_slice[:, i] if boxes_per_slice is not None else None
-            sparse_emb, _ = self.prompt_encoder(points=points, boxes=boxes, masks=None)
-            sparse_prompt_embeds.append(sparse_emb)
-        sparse_prompt_embeds = torch.stack(sparse_prompt_embeds, dim=1)
+        # Native plane sizes before the ViT. For a volume laid out as D,H,W:
+        # XY is HxW, XZ is DxW and YZ is DxH.
+        xy_hw = xy_slices.shape[-2:]
+        xz_hw = xz_slices.shape[-2:]
+        yz_hw = yz_slices.shape[-2:]
+        H, W = xy_hw
+        D = xz_hw[0]
+        if xz_hw[1] != W or yz_hw[0] != D or yz_hw[1] != H:
+            raise ValueError(
+                f"Inconsistent native plane sizes: XY={xy_hw}, XZ={xz_hw}, YZ={yz_hw}"
+            )
 
-        # 4. SDF解码器前向，输出3D点SDF预测值
+        # 三组原生尺寸图像分别过ViT图像编码器
+        feat_xy, xy_padded_hw = encode_plane(xy_slices)
+        feat_xz, xz_padded_hw = encode_plane(xz_slices)
+        feat_yz, yz_padded_hw = encode_plane(yz_slices)
+
+        B = feat_xy.shape[0]
+
+        # TriPlaneSampler uses (x, y, z), hence the order must be W, H, D.
+        padded_h, padded_w = xy_padded_hw
+        padded_d = xz_padded_hw[0]
+        if xz_padded_hw[1] != padded_w or yz_padded_hw != (padded_d, padded_h):
+            raise ValueError(
+                "The padded XY/XZ/YZ planes do not describe one consistent volume: "
+                f"XY={xy_padded_hw}, XZ={xz_padded_hw}, YZ={yz_padded_hw}"
+            )
+        volume_size = torch.tensor(
+            [padded_w, padded_h, padded_d], device=xy_slices.device
+        ).expand(B, -1)
+        Nxy = feat_xy.shape[1]
+        Nxz = feat_xz.shape[1]
+        Nyz = feat_yz.shape[1]
+
+        # Dense prompt PE must match each native feature grid (the three planes
+        # are generally rectangular and have different shapes).
+        def dense_pe_for(feat, N):
+            pe = self.prompt_encoder.pe_layer(feat.shape[-2:]).unsqueeze(0)
+            return pe.repeat(B, N, 1, 1, 1)
+
+        pe_xy = dense_pe_for(feat_xy, Nxy)
+        pe_xz = dense_pe_for(feat_xz, Nxz)
+        pe_yz = dense_pe_for(feat_yz, Nyz)
+
+        # 分别为三个视角生成box稀疏prompt
+        def build_prompt(box_batch, N, native_hw, padded_hw):
+            sp_list = []
+            native_h, native_w = native_hw
+            padded_h, padded_w = padded_hw
+            # Convert normalized native-image boxes into the normalized padded
+            # frame used by PatchEmbed.
+            native_to_padded = box_batch.new_tensor([
+                native_w / padded_w,
+                native_h / padded_h,
+                native_w / padded_w,
+                native_h / padded_h,
+            ])
+            for i in range(N):
+                # Dataset boxes are normalized to [0,1]. PromptEncoder expects
+                # coordinates in its configured input pixel frame.
+                scale = box_batch.new_tensor([
+                    self.prompt_encoder.input_image_size[1],
+                    self.prompt_encoder.input_image_size[0],
+                    self.prompt_encoder.input_image_size[1],
+                    self.prompt_encoder.input_image_size[0],
+                ])
+                box = box_batch[:, i, :] * native_to_padded * scale
+                sp, _ = self.prompt_encoder(points=None, boxes=box, masks=None)
+                sp_list.append(sp)
+            return torch.stack(sp_list, dim=1)
+
+        prompt_xy = build_prompt(xy_boxes, Nxy, xy_hw, xy_padded_hw)
+        prompt_xz = build_prompt(xz_boxes, Nxz, xz_hw, xz_padded_hw)
+        prompt_yz = build_prompt(yz_boxes, Nyz, yz_hw, yz_padded_hw)
+
+        # 送入三平面SDF解码器，不再传slice_z_positions
+
         sdf_pred = self.sdf_decoder(
-            slice_embeddings=slice_embeddings,
-            slice_pe=slice_pe,
-            prompt=sparse_prompt_embeds,
+            feat_xy=feat_xy,
+            feat_xz=feat_xz,
+            feat_yz=feat_yz,
+            pe_xy=pe_xy,
+            pe_xz=pe_xz,
+            pe_yz=pe_yz,
+            xy_rel=xy_rel,
+            xz_rel=xz_rel,
+            yz_rel=yz_rel,
+            prompt_xy=prompt_xy,
+            prompt_xz=prompt_xz,
+            prompt_yz=prompt_yz,
             query_points=query_points,
-            slice_z_positions=slice_z_positions,
-            img_size=img_size
+            img_size=volume_size,
+            # Eikonal loss differentiates the prediction w.r.t. query points
+            # with create_graph=True.  Forward the caller's flag so the decoder
+            # can detach grid-sampled image features and avoid requesting an
+            # unsupported second derivative of grid_sample.
+            eikonal_mode=eikonal_mode
         )
-
         return sdf_pred
+
+
 
     # def postprocess_masks(
     #     self,
