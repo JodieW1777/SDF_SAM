@@ -95,10 +95,14 @@ def build_sam_sdf(pretrained_path=None, embed_dim=256):
     # 4. 加载MedSAM预训练权重（如果文件存在才加载，不存在不报错）
     if pretrained_path is not None:
         import os
-        if os.path.exists(pretrained_path):
+        if os.path.isfile(pretrained_path):
             state_dict = torch.load(pretrained_path, map_location="cpu")
-            model.load_state_dict(state_dict, strict=False)
-            print("成功加载 MedSAM 预训练权重！")
+            incompatible = model.load_state_dict(state_dict, strict=False)
+            loaded_count = len(model.state_dict()) - len(incompatible.missing_keys)
+            print(
+                f"成功加载 MedSAM 兼容权重：{loaded_count}/{len(model.state_dict())} 个张量；"
+                f"新增模块随机初始化：{len(incompatible.missing_keys)} 个张量。"
+            )
         else:
             print("未找到预训练权重文件，跳过加载，模型从头训练。")
 
