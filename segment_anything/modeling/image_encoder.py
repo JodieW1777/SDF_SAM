@@ -109,7 +109,18 @@ class ImageEncoderViT(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x)
         if self.pos_embed is not None:
-            x = x + self.pos_embed
+            # The checkpoint contains a 64x64 absolute position grid for
+            # 1024x1024 inputs. Interpolate that grid to the native slice token
+            # grid; the image itself is never resized.
+            pos_embed = self.pos_embed
+            if pos_embed.shape[1:3] != x.shape[1:3]:
+                pos_embed = F.interpolate(
+                    pos_embed.permute(0, 3, 1, 2),
+                    size=x.shape[1:3],
+                    mode="bicubic",
+                    align_corners=False,
+                ).permute(0, 2, 3, 1)
+            x = x + pos_embed
 
         for blk in self.blocks:
             x = blk(x)
