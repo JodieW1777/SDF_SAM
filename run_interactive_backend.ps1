@@ -1,5 +1,5 @@
 param(
-    [string]$Checkpoint = "result/best_sdf_sam_slice_24_plane.pth",
+    [string]$Checkpoint = "result/best_sdf_sam_slice_24_plane_sp.pth",
     [string]$Device = "cuda",
     [int]$Port = 8765
 )
