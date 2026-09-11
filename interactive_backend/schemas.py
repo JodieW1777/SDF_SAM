@@ -12,7 +12,9 @@ class ReconstructionOptions(BaseModel):
         max_length=16,
         description="Row-major 4x4 MITK index-to-world matrix",
     )
-    num_slices: int = Field(8, ge=4, le=32)
+    image_shape_xyz: list[int] = Field(..., min_length=3, max_length=3)
+    num_slices: int = Field(4, ge=4, le=32)
+    reconstruction_margin: int = Field(10, ge=0, le=128)
     query_budget: int = Field(100_000, ge=8_000, le=2_000_000)
     query_chunk_size: int = Field(20_000, ge=512, le=100_000)
     level: float = 0.0
