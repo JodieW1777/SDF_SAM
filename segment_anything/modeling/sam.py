@@ -51,6 +51,7 @@ class Sam(nn.Module):
             query_points,
             points_per_slice,
             eikonal_mode=False,
+            detach_image_encoder=False,
     ) -> torch.Tensor:
     # 处理每组切片维度兼容：4维单病例自动加batch维
         def encode_plane(plane_img):
@@ -69,7 +70,14 @@ class Sam(nn.Module):
             flat = plane_img.reshape(-1, 3, H, W)
             if pad_h or pad_w:
                 flat = F.pad(flat, (0, pad_w, 0, pad_h))
-            feat = self.image_encoder(flat)
+            # Auxiliary finite-difference passes only need to optimize the SDF
+            # decoder. Detaching the encoder there prevents several full ViT
+            # activation graphs from being retained after end-to-end unfreeze.
+            if detach_image_encoder:
+                with torch.no_grad():
+                    feat = self.image_encoder(flat)
+            else:
+                feat = self.image_encoder(flat)
             return feat.unflatten(0, (B, N)), (H + pad_h, W + pad_w)
 
         # Native plane sizes before the ViT. For a volume laid out as D,H,W:
