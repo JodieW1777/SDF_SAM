@@ -22,7 +22,7 @@ engine: MedSAMReconstructionEngine | None = None
 async def lifespan(app: FastAPI):
     global engine
     checkpoint = os.environ.get(
-        "MEDSAM_INTERACTIVE_CHECKPOINT", "result/best_sdf_sam_slice_24_plane.pth"
+        "MEDSAM_INTERACTIVE_CHECKPOINT", "result/best_sdf_sam_slice_24_plane_24sp.pth"
     )
     device = os.environ.get("MEDSAM_INTERACTIVE_DEVICE", "cuda")
     engine = MedSAMReconstructionEngine(checkpoint, device)
@@ -38,6 +38,7 @@ def health():
     return {
         "status": "ready" if engine is not None else "starting",
         "device": str(engine.device) if engine is not None else None,
+        "checkpoint": engine.checkpoint if engine is not None else None,
     }
 
 
@@ -72,6 +73,14 @@ async def reconstruct(
         "X-Query-Count": str(result.query_count),
         "X-Grid-Shape": "x".join(map(str, result.grid_shape)),
         "X-Mesh-Coordinates": "image-index",
+        "X-Model-Checkpoint": engine.checkpoint,
+        "X-Prompt-BBox": ",".join(map(str, result.prompt_bbox)),
+        "X-Model-Prompt-BBox": ",".join(map(str, result.model_prompt_bbox)),
+        "X-Reconstruction-BBox": ",".join(map(str, result.reconstruction_bbox)),
+        "X-Mesh-BBox": ",".join(f"{v:.4f}" for v in result.mesh_bbox),
+        "X-Boundary-Negative-Ratio": ",".join(
+            f"{v:.6f}" for v in result.boundary_negative_ratio
+        ),
     }
     return FileResponse(
         mesh_path,
