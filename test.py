@@ -14,13 +14,13 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size
 
 # ===================== 全局超参（修改切片数量为4） =====================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-NUM_SLICES = 4  # 改为4张切片输入
+NUM_SLICES = 4  # 每个方向输入4张切片
 SLICE_BATCH_SIZE = 12  # 批次大小等于总切片，一次推理完成
 NUM_QUERY = 100000  # structured bbox grid budget (not random samples)
 QUERY_CHUNK_SIZE = 20000
-TARGET_ORGAN_ID = 9
+TARGET_ORGAN_ID = 2
 # 路径配置
-MODEL_WEIGHT = "result/best_sdf_sam_slice_24_plane.pth"
+MODEL_WEIGHT = "result/best_sdf_sam_slice_24_plane_sp.pth"
 NII_PATH = "data/FLARE22Train/images/FLARE22_Tr_0002_0000.nii.gz"
 # # 从3D Slicer导出的像素框 [x0, y0, z0, x1, y1, z1]
 # GLOBAL_BOX = [70, 109, 21, 218, 215, 75]
@@ -185,7 +185,7 @@ def get_valid_slices_in_box(img_vol, bbox, H, W):
     return sample_ids
 
 
-def build_batch_input(img_vol, bbox, num_slices=8):
+def build_batch_input(img_vol, bbox, num_slices=4):
     """
     bbox: [x0, y0, z0, x1, y1, z1] 全局3D包围盒
     返回三平面全套输入，完全匹配model forward参数
@@ -423,26 +423,26 @@ def full_sdf_to_mesh(img_vol, lab_vol, slice_sdf_vals, query_coords, bbox, sampl
     print("【Slicer专用】真值器官世界坐标网格 gt_organ_world.obj")
 
     # 导出真值label NII（同原始CT仿射）
-    lab_restore = lab_vol.transpose((1, 2, 0))
-    label_nii = nib.Nifti1Image(lab_restore, nii_affine)
-    nib.save(label_nii, "./gt_organ_label.nii.gz")
-    print("【对比真值】gt_organ_label.nii.gz 已保存")
+    # lab_restore = lab_vol.transpose((1, 2, 0))
+    # label_nii = nib.Nifti1Image(lab_restore, nii_affine)
+    # nib.save(label_nii, "./gt_organ_label.nii.gz")
+    # print("【对比真值】gt_organ_label.nii.gz 已保存")
 
     # 由SDF生成器官二值mask：SDF<0 = 器官内部
     organ_mask = (full_sdf < 0).astype(np.float32)
 
     # 关键：D,H,W 转回原图原始 (H,W) 维度匹配affine
-    mask_save = organ_mask.transpose((1, 2, 0))
-    mask_nii = nib.Nifti1Image(mask_save, nii_affine)
-    nib.save(mask_nii, "./pred_organ_mask.nii.gz")
-    print("预测器官掩码已保存 pred_organ_mask.nii.gz，可直接在Slicer和CT叠加查看")
+    # mask_save = organ_mask.transpose((1, 2, 0))
+    # mask_nii = nib.Nifti1Image(mask_save, nii_affine)
+    # nib.save(mask_nii, "./pred_organ_mask.nii.gz")
+    # print("预测器官掩码已保存 pred_organ_mask.nii.gz，可直接在Slicer和CT叠加查看")
     organ_mask = (full_sdf < 0).astype(np.uint8)  # 关键：转uint8整数，不是float
     # D,H,W → 还原原始CT H,W,D维度
     mask_save = organ_mask.transpose((1, 2, 0))
     # 文件名带上label，让Slicer自动识别为标签图
-    mask_nii = nib.Nifti1Image(mask_save, nii_affine)
-    nib.save(mask_nii, "./pred_label.nii.gz")
-    print("输出pred_label.nii.gz，和gt_organ_label完全一致格式")
+    # mask_nii = nib.Nifti1Image(mask_save, nii_affine)
+    # nib.save(mask_nii, "./pred_label.nii.gz")
+    # print("输出pred_label.nii.gz，和gt_organ_label完全一致格式")
     # sdf_restore = full_sdf.transpose((1, 2, 0))
     # sdf_nii = nib.Nifti1Image(sdf_restore, nii_affine)
     # nib.save(sdf_nii, "./pred_sdf_volume.nii.gz")
@@ -460,7 +460,7 @@ def full_sdf_to_mesh(img_vol, lab_vol, slice_sdf_vals, query_coords, bbox, sampl
 if __name__ == "__main__":
     print("加载 SDF-SAM 模型...")
 
-    model = build_sam_sdf(pretrained_path="result/best_sdf_sam_slice_24_plane.pth")
+    model = build_sam_sdf(pretrained_path="result/best_sdf_sam_slice_24_plane_sp.pth")
     model.load_state_dict(torch.load(MODEL_WEIGHT, map_location=DEVICE))
     model.to(DEVICE)
     model.eval()
