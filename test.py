@@ -2,6 +2,7 @@
 import numpy as np
 import torch
 import os
+import json
 import nibabel as nib
 from skimage.measure import marching_cubes
 import trimesh
@@ -10,23 +11,195 @@ from segment_anything import build_sam_sdf
 import torch.nn.functional as F
 
 from scipy.interpolate import griddata
+from scipy.spatial import cKDTree
+from scipy.ndimage import distance_transform_edt
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
 
-# ===================== 全局超参（修改切片数量为4） =====================
+# ===================== S0：所有结构模块完整启用 =====================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 NUM_SLICES = 4  # 每个方向输入4张切片
 SLICE_BATCH_SIZE = 12  # 批次大小等于总切片，一次推理完成
-NUM_QUERY = 100000  # structured bbox grid budget (not random samples)
+NUM_QUERY = 100000  # baseline x/y grid budget; z always uses every native slice
 QUERY_CHUNK_SIZE = 20000
-TARGET_ORGAN_ID = 2
+TARGET_ORGAN_ID =1
+# Mesh-only post-processing. These values remove tiny disconnected islands
+# while retaining any substantial disconnected anatomy, then apply a mild
+# volume-preserving Taubin smoothing pass.
+MESH_MIN_COMPONENT_FACES = 100
+MESH_MIN_COMPONENT_RATIO = 0.01
+# Each inference targets one anatomical organ. Keep exactly one connected
+# surface so even a relatively large false-positive island is removed.
+MESH_KEEP_LARGEST_ONLY = True
+MESH_TAUBIN_ITERATIONS = 10
+MESH_TAUBIN_LAMBDA = 0.50
+MESH_TAUBIN_NU = 0.53
+MESH_METRIC_SAMPLES = 20000
+SURFACE_DICE_TOLERANCE_MM = 2.0
+SDF_TRUNC_MM = 10.0
 # 路径配置
-MODEL_WEIGHT = "result/best_sdf_sam_slice_24_plane_sp.pth"
+MODEL_WEIGHT = "Ablation Study/L0_exp/best_hd95.pth"
 NII_PATH = "data/FLARE22Train/images/FLARE22_Tr_0002_0000.nii.gz"
 # # 从3D Slicer导出的像素框 [x0, y0, z0, x1, y1, z1]
 # GLOBAL_BOX = [70, 109, 21, 218, 215, 75]
 
 
 # ===================== 工具函数 =====================
+def clamp_bbox_to_volume(bbox, volume_shape_dhw):
+    """Clamp an inclusive xyzxyz box to a D,H,W voxel volume."""
+    if len(bbox) != 6:
+        raise ValueError(f"3D框必须是[x0,y0,z0,x1,y1,z1]，当前为: {bbox}")
+    D, H, W = (int(v) for v in volume_shape_dhw)
+    raw = np.asarray(bbox, dtype=np.float64)
+    lo = np.floor(np.minimum(raw[:3], raw[3:])).astype(np.int64)
+    hi = np.ceil(np.maximum(raw[:3], raw[3:])).astype(np.int64)
+    max_xyz = np.array([W - 1, H - 1, D - 1], dtype=np.int64)
+    lo = np.clip(lo, 0, max_xyz)
+    hi = np.clip(hi, 0, max_xyz)
+    if np.any(lo >= hi):
+        raise ValueError(
+            f"框在CT范围内为空: 原框={list(bbox)}, 限幅后={lo.tolist()+hi.tolist()}, "
+            f"CT尺寸(D,H,W)={volume_shape_dhw}"
+        )
+    clamped = np.concatenate([lo, hi]).tolist()
+    if not np.array_equal(raw, np.asarray(clamped, dtype=np.float64)):
+        print(f"警告: 框超出CT范围，已从 {list(bbox)} 限幅为 {clamped}")
+    return clamped
+
+
+def clean_and_smooth_mesh(mesh):
+    """Remove small disconnected patches and mildly smooth a prediction.
+
+    Filtering uses both triangle count and physical surface area. The largest
+    component is always retained; other components must reach the configured
+    fraction of the largest component in both measures. Taubin smoothing is
+    used instead of ordinary Laplacian smoothing to limit volume shrinkage.
+    """
+    mesh = mesh.copy()
+    if len(mesh.faces) == 0:
+        raise ValueError("Predicted mesh contains no triangles")
+
+    mesh.update_faces(mesh.nondegenerate_faces())
+    mesh.update_faces(mesh.unique_faces())
+    mesh.remove_unreferenced_vertices()
+
+    components = list(mesh.split(only_watertight=False))
+    if not components:
+        raise ValueError("Predicted mesh has no connected surface component")
+    components.sort(key=lambda part: float(part.area), reverse=True)
+
+    largest = components[0]
+    min_faces = max(
+        int(MESH_MIN_COMPONENT_FACES),
+        int(np.ceil(len(largest.faces) * MESH_MIN_COMPONENT_RATIO)),
+    )
+    min_area = float(largest.area) * MESH_MIN_COMPONENT_RATIO
+    if MESH_KEEP_LARGEST_ONLY:
+        kept = [largest]
+    else:
+        kept = [
+            part for index, part in enumerate(components)
+            if index == 0
+            or (len(part.faces) >= min_faces and float(part.area) >= min_area)
+        ]
+
+    cleaned = trimesh.util.concatenate(kept)
+    cleaned.remove_unreferenced_vertices()
+    before_vertices = cleaned.vertices.copy()
+    if MESH_TAUBIN_ITERATIONS > 0 and len(cleaned.vertices) > 3:
+        trimesh.smoothing.filter_taubin(
+            cleaned,
+            lamb=MESH_TAUBIN_LAMBDA,
+            nu=MESH_TAUBIN_NU,
+            iterations=MESH_TAUBIN_ITERATIONS,
+        )
+        if not np.isfinite(cleaned.vertices).all():
+            cleaned.vertices = before_vertices
+            raise ValueError("Taubin smoothing produced non-finite vertices")
+
+    removed = len(components) - len(kept)
+    print(
+        "网格后处理: "
+        f"连通分量 {len(components)} -> {len(kept)}，删除 {removed} 个小面片；"
+        f"输出 {len(cleaned.vertices)} 顶点/{len(cleaned.faces)} 三角面；"
+        f"Taubin迭代 {MESH_TAUBIN_ITERATIONS} 次"
+    )
+    return cleaned
+
+
+def evaluate_reconstruction(pred_mask, gt_mask, pred_mesh, gt_mesh):
+    """Evaluate occupancy and physical surface similarity in millimetres."""
+    pred_mask = np.asarray(pred_mask, dtype=bool)
+    gt_mask = np.asarray(gt_mask, dtype=bool)
+    intersection = np.logical_and(pred_mask, gt_mask).sum(dtype=np.float64)
+    denominator = pred_mask.sum(dtype=np.float64) + gt_mask.sum(dtype=np.float64)
+    dice = (2.0 * intersection / denominator) if denominator > 0 else 1.0
+    union = np.logical_or(pred_mask, gt_mask).sum(dtype=np.float64)
+    iou = (intersection / union) if union > 0 else 1.0
+
+    pred_points, _ = trimesh.sample.sample_surface(
+        pred_mesh, MESH_METRIC_SAMPLES, seed=0
+    )
+    gt_points, _ = trimesh.sample.sample_surface(
+        gt_mesh, MESH_METRIC_SAMPLES, seed=1
+    )
+    pred_to_gt = cKDTree(gt_points).query(pred_points, workers=-1)[0]
+    gt_to_pred = cKDTree(pred_points).query(gt_points, workers=-1)[0]
+    both = np.concatenate([pred_to_gt, gt_to_pred])
+
+    assd_mm = 0.5 * (pred_to_gt.mean() + gt_to_pred.mean())
+    chamfer_l2_mm2 = 0.5 * (
+        np.mean(pred_to_gt ** 2) + np.mean(gt_to_pred ** 2)
+    )
+    hd95_mm = np.percentile(both, 95.0)
+    hausdorff_mm = both.max()
+    surface_dice = 0.5 * (
+        np.mean(pred_to_gt <= SURFACE_DICE_TOLERANCE_MM)
+        + np.mean(gt_to_pred <= SURFACE_DICE_TOLERANCE_MM)
+    )
+
+    metrics = {
+        "Dice": float(dice),
+        "IoU": float(iou),
+        "ASSD_mm": float(assd_mm),
+        "ChamferL2_mm2": float(chamfer_l2_mm2),
+        "HD95_mm": float(hd95_mm),
+        "Hausdorff_mm": float(hausdorff_mm),
+        f"SurfaceDice@{SURFACE_DICE_TOLERANCE_MM:g}mm": float(surface_dice),
+    }
+    print("==== 重建精度（物理空间） ====")
+    for name, value in metrics.items():
+        print(f"{name}: {value:.6f}")
+    print("==============================")
+    return metrics
+
+
+def evaluate_sdf_prediction(pred_tsdf, gt_mask, spacing_zyx):
+    """Compare normalized prediction against a physical millimetre TSDF."""
+    gt_mask = np.asarray(gt_mask, dtype=bool)
+    inside = distance_transform_edt(gt_mask, sampling=spacing_zyx)
+    outside = distance_transform_edt(~gt_mask, sampling=spacing_zyx)
+    gt_tsdf = np.clip(outside - inside, -SDF_TRUNC_MM, SDF_TRUNC_MM)
+    gt_tsdf = (gt_tsdf / SDF_TRUNC_MM).astype(np.float32)
+    pred_tsdf = np.asarray(pred_tsdf, dtype=np.float32)
+    error = pred_tsdf - gt_tsdf
+    surface = np.abs(gt_tsdf) <= (2.0 / SDF_TRUNC_MM)
+    metrics = {
+        "SDF_MAE_normalized": float(np.mean(np.abs(error))),
+        "SDF_RMSE_normalized": float(np.sqrt(np.mean(error ** 2))),
+        "SDF_MAE_mm": float(np.mean(np.abs(error)) * SDF_TRUNC_MM),
+        "SDF_RMSE_mm": float(np.sqrt(np.mean(error ** 2)) * SDF_TRUNC_MM),
+        "SDF_SignAccuracy": float(np.mean((pred_tsdf >= 0) == (gt_tsdf >= 0))),
+        "SDF_SurfaceBandMAE_mm": float(
+            np.mean(np.abs(error[surface])) * SDF_TRUNC_MM
+        ),
+    }
+    print("==== SDF预测精度（重建框内） ====")
+    for name, value in metrics.items():
+        print(f"{name}: {value:.6f}")
+    print("================================")
+    return metrics
+
+
 def get_single_organ_box(lab_vol, target_id, padding=2):
     """仅根据单个器官生成包围盒，忽略其余器官"""
     single_mask = (lab_vol == target_id)
@@ -44,13 +217,17 @@ def get_single_organ_box(lab_vol, target_id, padding=2):
     zmax_raw = z_coords.max()
 
     D, H, W = lab_vol.shape
+    padding_xyz = np.broadcast_to(
+        np.asarray(padding, dtype=np.int64), (3,)
+    )
+    pad_x, pad_y, pad_z = padding_xyz.tolist()
     # 向外padding，并限制不越界
-    xmin = max(0, xmin_raw - padding)
-    xmax = min(W - 1, xmax_raw + padding)
-    ymin = max(0, ymin_raw - padding)
-    ymax = min(H - 1, ymax_raw + padding)
-    zmin = max(0, zmin_raw - padding)
-    zmax = min(D - 1, zmax_raw + padding)
+    xmin = max(0, xmin_raw - pad_x)
+    xmax = min(W - 1, xmax_raw + pad_x)
+    ymin = max(0, ymin_raw - pad_y)
+    ymax = min(H - 1, ymax_raw + pad_y)
+    zmin = max(0, zmin_raw - pad_z)
+    zmax = min(D - 1, zmax_raw + pad_z)
     return [xmin, ymin, zmin, xmax, ymax, zmax]
 
 # def get_auto_global_box(lab_vol, padding=2):
@@ -96,6 +273,7 @@ def sample_axis_slices(vol, full_bbox, axis, num_slices):
     return slice_tensor, rel_tensor, plane_box_tensor
     """
     D, H, W = vol.shape
+    full_bbox = clamp_bbox_to_volume(full_bbox, vol.shape)
     # 拆解全局包围盒，所有坐标来源统一，无陌生变量
     x0, y0, z0, x1, y1, z1 = full_bbox
     # 各轴有效采样区间
@@ -153,16 +331,8 @@ def get_valid_slices_in_box(img_vol, bbox, H, W):
     :param W: 原始宽度
     :return: 采样的切片索引
     """
-    if len(bbox) != 6:
-        raise ValueError(f"3D框坐标需为6个值 [x0,y0,z0,x1,y1,z1]，当前输入：{bbox}")
+    bbox = clamp_bbox_to_volume(bbox, img_vol.shape)
     x0, y0, z0, x1, y1, z1 = bbox
-    # 修正XY越界
-    x0 = max(0, x0)
-    y0 = max(0, y0)
-    z0 = max(0, z0)
-    x1 = min(W, x1)
-    y1 = min(H, y1)
-    z1 = min(img_vol.shape[0], z1)
     if x0 >= x1 or y0 >= y1 or z0 >= z1:
         raise ValueError(f"无效的3D框坐标：{bbox}，x:{x0}-{x1}, y:{y0}-{y1}, z:{z0}-{z1}")
 
@@ -191,20 +361,25 @@ def build_batch_input(img_vol, bbox, num_slices=4):
     返回三平面全套输入，完全匹配model forward参数
     """
     D, H, W = img_vol.shape
+    bbox = clamp_bbox_to_volume(bbox, img_vol.shape)
     x0, y0, z0, x1, y1, z1 = bbox
     # 分别生成XY / XZ / YZ 三组切片、rel、平面框
     xy_slices, xy_rel, xy_box = sample_axis_slices(img_vol, bbox, axis=0, num_slices=num_slices)
     xz_slices, xz_rel, xz_box = sample_axis_slices(img_vol, bbox, axis=1, num_slices=num_slices)
     yz_slices, yz_rel, yz_box = sample_axis_slices(img_vol, bbox, axis=2, num_slices=num_slices)
 
-    # Build a regular, aspect-ratio-preserving grid. Random points followed by
-    # integer rounding left duplicate samples and holes in the interpolated SDF.
+    # Build a regular grid.  Never decimate the z axis: predicting only a small
+    # number of z planes and trilinearly expanding them back to the native CT
+    # depth creates periodic horizontal terraces in the zero level set.  The
+    # query budget controls the initial x/y density only; every native z index
+    # inside the reconstruction box is evaluated by the network.
     extents = np.array([x1 - x0 + 1, y1 - y0 + 1, z1 - z0 + 1], dtype=np.float64)
     scale = min(1.0, (NUM_QUERY / np.prod(extents)) ** (1.0 / 3.0))
     counts = np.maximum(2, np.ceil(extents * scale).astype(int))
+    counts[2] = int(extents[2])
     xs = np.linspace(x0, x1, counts[0], dtype=np.float32)
     ys = np.linspace(y0, y1, counts[1], dtype=np.float32)
-    zs = np.linspace(z0, z1, counts[2], dtype=np.float32)
+    zs = np.arange(z0, z1 + 1, dtype=np.float32)
     zz, yy, xx = np.meshgrid(zs, ys, xs, indexing="ij")
     query_pts = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
     raw_query_np = query_pts.copy()
@@ -254,7 +429,7 @@ def batch_sdf_inference(
             xz_boxes=xz_box_sub,
             yz_boxes=yz_box_sub,
             query_points=q_batch,
-            points_per_slice=None
+            points_per_slice=None,
         )
         pred_list.append(sdf_sub.squeeze(0).cpu())
     full_pred = torch.cat(pred_list, dim=0)
@@ -299,7 +474,10 @@ def full_sdf_to_mesh(img_vol, lab_vol, slice_sdf_vals, query_coords, bbox, sampl
     yi = np.arange(int(np.floor(y_min)), int(np.ceil(y_max)) + 1)
     xi = np.arange(int(np.floor(x_min)), int(np.ceil(x_max)) + 1)
 
-    # 用PyTorch三线性插值：规则网格→规则网格，速度远快于griddata
+    # Keep the original 3-D trilinear reconstruction.  The sampling grid now
+    # already contains every native z index, so this interpolation no longer
+    # expands a sparse set of z planes (for example 20 planes) to the full CT
+    # depth.  It mainly restores the remaining x/y grid resolution.
     coarse_tensor = torch.from_numpy(coarse_sdf).unsqueeze(0).unsqueeze(0)
     local_sdf = F.interpolate(
         coarse_tensor,
@@ -368,9 +546,22 @@ def full_sdf_to_mesh(img_vol, lab_vol, slice_sdf_vals, query_coords, bbox, sampl
         real_level = np.percentile(full_sdf[full_sdf < 9.0], 50)
         verts_pred_pix, faces_pred, _, _ = marching_cubes(full_sdf, level=real_level)
         # 真值像素网格
-    mask_bin = (lab_vol > 0).astype(np.float32)
-    mask_bin = (lab_vol > 0).astype(np.float32)
-    vert_gt_pix, face_gt, _, _ = marching_cubes(mask_bin, level=0.1)
+    # Compare against the selected organ only. ``lab_vol > 0`` merges every
+    # labelled organ and makes unrelated anatomy look like prediction islands.
+    mask_bin = (lab_vol == TARGET_ORGAN_ID).astype(np.float32)
+    spacing_ijk = nib.affines.voxel_sizes(nii_affine).astype(np.float32)
+    spacing_zyx = spacing_ijk[[2, 0, 1]]
+    gt_local_mask = mask_bin[
+        zi[0]:zi[-1] + 1,
+        yi[0]:yi[-1] + 1,
+        xi[0]:xi[-1] + 1,
+    ]
+    sdf_metrics = evaluate_sdf_prediction(
+        local_sdf, gt_local_mask, spacing_zyx
+    )
+    # Binary masks use the midpoint isosurface. level=0.1 expands the GT
+    # surface toward background and biases surface-distance comparisons.
+    vert_gt_pix, face_gt, _, _ = marching_cubes(mask_bin, level=0.5)
 
     def pix2world(pix_verts, affine):
         """
@@ -409,18 +600,36 @@ def full_sdf_to_mesh(img_vol, lab_vol, slice_sdf_vals, query_coords, bbox, sampl
     verts_pred_world = pix2world(verts_pred_pix, nii_affine)
     vert_gt_world = pix2world(vert_gt_pix, nii_affine)
 
-    # 预测网格（世界坐标，灰色）
-    pred_mesh = trimesh.Trimesh(vertices=verts_pred_world, faces=faces_pred)
+    # Export the raw marching-cubes surface. Do not clean or smooth it here:
+    # validation/test metrics must reflect the network's actual zero level set.
+    pred_mesh_raw = trimesh.Trimesh(
+        vertices=verts_pred_world, faces=faces_pred, process=False
+    )
+    pred_mesh_raw.remove_unreferenced_vertices()
+    pred_mesh = pred_mesh_raw
 
-    pred_mesh.export("./pred_organ_world.obj")
-    print("【Slicer专用】预测器官世界坐标网格 pred_organ_world.obj")
+    result_dir = "./Ablation Study/L0_exp/result"
+    os.makedirs(result_dir, exist_ok=True)
+    raw_mesh_path = os.path.join(result_dir, "pred_organ_world_raw3.obj")
+    pred_mesh.export(raw_mesh_path)
+    print(f"【原始预测】未清理、未平滑网格: {raw_mesh_path}")
 
     # 真值网格（世界坐标，绿色半透明）
     gt_mesh = trimesh.Trimesh(vertices=vert_gt_world, faces=face_gt)
     gt_mesh.visual.vertex_colors = np.full((len(gt_mesh.vertices), 3), [30, 220, 80], dtype=np.uint8)
     gt_mesh.export("./gt_organ_world.obj")
-    gt_mesh.show()
     print("【Slicer专用】真值器官世界坐标网格 gt_organ_world.obj")
+
+    reconstruction_metrics = evaluate_reconstruction(
+        full_sdf < 0,
+        mask_bin > 0,
+        pred_mesh,
+        gt_mesh,
+    )
+    reconstruction_metrics.update(sdf_metrics)
+    with open(os.path.join(result_dir, "reconstruction_metrics3.json"), "w", encoding="utf-8") as fp:
+        json.dump(reconstruction_metrics, fp, ensure_ascii=False, indent=2)
+    print("重建评价已保存: reconstruction_metrics.json")
 
     # 导出真值label NII（同原始CT仿射）
     # lab_restore = lab_vol.transpose((1, 2, 0))
@@ -449,18 +658,24 @@ def full_sdf_to_mesh(img_vol, lab_vol, slice_sdf_vals, query_coords, bbox, sampl
     # print("稠密SDF体文件 pred_sdf_volume.nii.gz 已生成，Slicer加载CT直接对齐无偏移")
 
     # ========= 合并对比场景（像素坐标，本地查看用） =========
-    scene = trimesh.Scene()
-    scene.add_geometry(gt_mesh, "gt_organ_green")
-    scene.add_geometry(pred_mesh, "pred_organ_gray")
-    scene.export("./compare_pred_gt.obj")
-    print("【本地查看】对比网格 compare_pred_gt.obj")
+    # scene = trimesh.Scene()
+    # scene.add_geometry(gt_mesh, "gt_organ_green")
+    # scene.add_geometry(pred_mesh, "pred_organ_gray")
+    # scene.export("./compare_pred_gt.obj")
+    # print("【本地查看】对比网格 compare_pred_gt.obj")
 
     return pred_mesh, full_sdf
 
 if __name__ == "__main__":
     print("加载 SDF-SAM 模型...")
 
-    model = build_sam_sdf(pretrained_path="result/best_sdf_sam_slice_24_plane_sp.pth")
+    model = build_sam_sdf(
+        pretrained_path=MODEL_WEIGHT,
+        view_mode="triplane",
+        use_cross_slice_fusion=True,
+        view_fusion_mode="attention",
+        use_3d_position_encoding=True,
+    )
     model.load_state_dict(torch.load(MODEL_WEIGHT, map_location=DEVICE))
     model.to(DEVICE)
     model.eval()
@@ -473,12 +688,37 @@ if __name__ == "__main__":
     img_vol = img_data.transpose((2, 0, 1))  # (D, H, W)
     D, H, W = img_vol.shape
     print(f"3D体尺寸: D={D}, H={H}, W={W}")
-    LABEL_PATH = "data/FLARE22Train/labels/FLARE22_Tr_0002.nii.gz"
+    # Derive the matching label from the selected CT case so changing
+    # NII_PATH cannot silently pair (for example) case 0003 with label 0002.
+    image_name = os.path.basename(NII_PATH)
+    label_name = image_name.replace("_0000.nii.gz", ".nii.gz")
+    LABEL_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(NII_PATH)), "labels", label_name
+    )
+    print(f"匹配标签路径: {LABEL_PATH}")
     label_nii = nib.load(LABEL_PATH)
     lab_data = label_nii.get_fdata()
     lab_vol = lab_data.transpose((2, 0, 1))
+    if lab_vol.shape != img_vol.shape:
+        raise ValueError(
+            "CT与标签体素尺寸不一致，不能直接共用体素框: "
+            f"CT(D,H,W)={img_vol.shape}, 标签(D,H,W)={lab_vol.shape}。"
+            "请检查NII_PATH与LABEL_PATH是否属于同一病例，或先将标签按CT几何做最近邻重采样。"
+        )
+    if not np.allclose(nii_affine, label_nii.affine, rtol=0.0, atol=1e-4):
+        raise ValueError(
+            "CT与标签affine不一致，标签框不能直接用于CT。"
+            "请先把标签按CT空间做最近邻重采样。"
+        )
     print("Affine Z缩放系数：", nii_affine[2, 2])
-    GLOBAL_BOX = get_single_organ_box(lab_vol, TARGET_ORGAN_ID, padding=10)
+    spacing_ijk = nib.affines.voxel_sizes(nii_affine).astype(np.float32)
+    spacing_xyz = spacing_ijk[[1, 0, 2]]
+    prompt_padding_xyz = np.ceil(10.0 / spacing_xyz).astype(np.int64)
+    print(f"模型xyz spacing(mm): {spacing_xyz.tolist()}")
+    GLOBAL_BOX = get_single_organ_box(
+        lab_vol, TARGET_ORGAN_ID, padding=prompt_padding_xyz
+    )
+    GLOBAL_BOX = clamp_bbox_to_volume(GLOBAL_BOX, img_vol.shape)
     # GLOBAL_BOX =[70, 109, 21, 218, 215, 72]
     print("自动基于真值生成Global Box：", GLOBAL_BOX)
     # x0, y0, z0, x1, y1, z1 = GLOBAL_BOX
@@ -521,10 +761,9 @@ if __name__ == "__main__":
 
     # 生成3D网格
     print("生成3D表面网格...")
-    single_organ_lab = (lab_vol == TARGET_ORGAN_ID).astype(np.float32)
     mesh, _ = full_sdf_to_mesh(
         img_vol,
-        single_organ_lab,
+        lab_vol,
         sdf_vals,
         raw_query_np,
         GLOBAL_BOX,
